@@ -1,0 +1,157 @@
+[
+ {
+  "name": "wordy+dup",
+  "text": "Six weeks ago I pulled out of school and shut the fuck up. I didnt tell my friends and I didnt tell my peers. In order to be able to make progress at this point in time, it was decided by me that the best course of action would be to send a very large number of cold emails to founders. I lived in a tiny apartment with a blanket over the window to block the sun. It did not feel great. As I said before, it did not feel great at all. Then one morning a founder replied, we got on a call, and by the next day the deal was done. We raised over half a million dollars from Verdict Capital on October 12 to kill slop companies.",
+  "expect": {
+   "1": "keep",
+   "2": "keep",
+   "3": "rephrase",
+   "4": "keep",
+   "5": "keep",
+   "6": "remove",
+   "7": "keep",
+   "8": "keep"
+  }
+ },
+ {
+  "name": "clean prose",
+  "text": "The sun came up over the hills. We packed the truck before breakfast. Maria drove the first stretch while I slept. By noon we had crossed into Nevada. Nobody said much. The radio played the same four songs. We stopped for gas in a town with one light.",
+  "expect": {
+   "1": "keep",
+   "2": "keep",
+   "3": "keep",
+   "4": "keep",
+   "5": "keep",
+   "6": "keep",
+   "7": "keep"
+  },
+  "max_actions": 1
+ },
+ {
+  "name": "business wordy",
+  "text": "Please be advised that the meeting has been rescheduled. At this point in time we are not in a position to confirm the venue. It is important to note that attendance is mandatory for all team members. In the event that you are unable to attend, please notify your manager. We will circle back with further details in due course.",
+  "expect": {
+   "2": "rephrase",
+   "3": "rephrase",
+   "4": "rephrase",
+   "5": "rephrase"
+  },
+  "no_remove": true
+ },
+ {
+  "name": "facts stay",
+  "text": "Our Q3 revenue was $1.2M, up 34% from Q2. We signed 17 new customers, including Acme Corp and Globex. Churn fell to 2.1%. The team grew from 9 to 14 people.",
+  "expect": {
+   "1": "keep",
+   "2": "keep",
+   "3": "keep",
+   "4": "keep"
+  },
+  "no_remove": true,
+  "max_actions": 1
+ },
+ {
+  "name": "repeats",
+  "text": "I love this city. The food is amazing and the people are kind. I love this city so much. Every street has a story. The food here is amazing. I could live here forever.",
+  "expect": {
+   "1": "keep",
+   "2": "keep",
+   "3": "remove",
+   "4": "keep",
+   "5": "remove",
+   "6": "keep"
+  }
+ },
+ {
+  "name": "filler",
+  "text": "So here is the thing. Basically, what I am trying to say is this. The launch went well. We had 400 signups in the first hour. Anyway, that is what happened. Thanks for reading.",
+  "expect": {
+   "2": "remove",
+   "3": "keep",
+   "4": "keep",
+   "5": "remove",
+   "6": "keep"
+  }
+ },
+ {
+  "name": "casual voice",
+  "text": "ngl this week was rough lol. my laptop died on tuesday. then my landlord showed up unannounced. whatever, we move. got the new machine friday and im back.",
+  "expect": {
+   "1": "keep",
+   "2": "keep",
+   "3": "keep",
+   "4": "keep",
+   "5": "keep"
+  },
+  "max_actions": 1
+ },
+ {
+  "name": "passive tangled",
+  "text": "The decision to delay the launch was made by the leadership team after it had been determined by the engineers that the payment system, which had been built over the previous six months by a contractor who was no longer with the company, could not be trusted. We will launch in March.",
+  "expect": {
+   "1": "rephrase",
+   "2": "keep"
+  }
+ },
+ {
+  "name": "academic",
+  "text": "The results of the experiment, which were obtained through the utilization of a double-blind methodology, indicate that there is a significant correlation between sleep duration and memory consolidation. Participants who slept eight hours recalled 23% more words than those who slept four. This finding is consistent with prior literature.",
+  "expect": {
+   "1": "rephrase",
+   "2": "keep"
+  },
+  "no_remove": true
+ },
+ {
+  "name": "mann real",
+  "text": "I took the biggest risk of my ENTIRE LIFE. but to make you understand, i have to take you back, to exactly 42 days ago. Up til this point I had been working on publik after going viral over the summer for cloning apps, i wasnt getting me any closer ot my goals. I pulled out of school, and shut the fuck up. I didnt tell my family, not my friends, and not my peers. I had very little money.",
+  "expect": {
+   "1": "keep",
+   "4": "keep",
+   "5": "keep",
+   "6": "keep"
+  },
+  "no_remove": true,
+  "max_actions": 3
+ },
+ {
+  "name": "quote stays",
+  "text": "She said, \"we are not raising this year,\" and walked out. That line stuck with me. I think about it every single time I open my inbox in the morning before I have even had coffee.",
+  "expect": {
+   "1": "keep",
+   "2": "keep"
+  },
+  "no_remove": true
+ },
+ {
+  "name": "hedge heavy",
+  "text": "I think that we should probably consider maybe moving the deadline. The reason for this is due to the fact that the designs are not ready. Honestly the designs look great. The deadline is Friday.",
+  "expect": {
+   "1": "rephrase",
+   "2": "rephrase",
+   "3": "keep",
+   "4": "keep"
+  },
+  "no_remove": true
+ },
+ {
+  "name": "script run-on",
+  "text": "So here is what actually happened. After the video blew up i kinda realized that school wasnt bringing me any closer to my goals. I had an audience, but no money. i wish i could say that i felt some sort of conviction, but honestly, it was stranger than anything i had ever experienced, and with every day that went by without results i couldnt help but question if i had made the right choice. Every day i woke up in my college apartment, made videos, and worked on my startup in a town where everyone around me studied. Nobody knew. Then one morning my cofounder sent out our 1068th investor email and someone finally replied.",
+  "max_actions": 2,
+  "expect": {
+   "4": "rephrase",
+   "5": "keep",
+   "2": "keep",
+   "6": "keep"
+  }
+ },
+ {
+  "name": "long but clear",
+  "text": "The committee reviewed the three proposals on Tuesday, asked each team for a revised budget by Friday, and plans to announce the winner at the all-hands meeting on the first of March. Because the venue had to be booked six months ahead and the caterer needed a final headcount, and since the speakers could only confirm after their visa interviews, which were themselves delayed twice, the date slipped to May 14. The new date works for everyone.",
+  "no_remove": true,
+  "expect": {
+   "2": "rephrase",
+   "3": "keep"
+  }
+ }
+]

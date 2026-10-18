@@ -1,0 +1,172 @@
+import { useEffect, useState } from "react";
+import type { Ctx } from "../Panel";
+import { ipc } from "../../lib/ipc";
+import { keyKind } from "../../lib/text";
+import type { LlmConfig, PublikStatus } from "../../lib/types";
+import * as I from "../../components/icons";
+
+type Choice = "publik" | "key";
+
+/** Which card is on: publik API once its key exists, your own key once one is pasted, else none. */
+function currentChoice(llm: LlmConfig, publik: PublikStatus): Choice | null {
+  if (llm.provider === "publik") return publik.has_key ? "publik" : null;
+  return llm.api_key.trim().length > 0 ? "key" : null;
+}
+
+/**
+ * The AI picker shared by onboarding and Settings. Two cards, no URLs or
+ * ports: publik API (zero setup) and your own key (one field, provider
+ * detected). The plumbing sits behind "Advanced". There is no local-model card.
+ */
+export function AiSetup({ ctx, mode, onDone }: { ctx: Ctx; mode: "onboarding" | "settings"; onDone?: () => void }) {
+  const llm = ctx.settings.llm;
+  const publik = ctx.publik;
+  const choice = currentChoice(llm, publik);
+  const keyConnected = choice === "key";
+  const [open, setOpen] = useState<Choice | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [key, setKey] = useState("");
+  const [ping, setPing] = useState<string | null>(null);
+
+  useEffect(() => { if (choice === "publik" && publik.has_key) ipc.publikRefresh().catch(() => {}); }, [choice, publik.has_key]);
+
+  const finish = () => { if (mode === "onboarding") onDone?.(); };
+
+  const turnOnPublik = async () => {
+    setBusy(true); setError(null);
+    try {
+      // The first-run card (balance line, justification, "Sign in with publik") must be seen
+      // before any usage; onboarding ends from that card's buttons, not here.
+      const st = await ipc.publikAccept(); ctx.refresh(); setOpen(null); ctx.toast("publik API is on");
+      if (!st.first_run_owed) finish();
+    }
+    catch (e) { setError(String(e)); }
+    finally { setBusy(false); }
+  };
+  const connectKey = async () => {
+    setBusy(true); setError(null);
+    try {
+      const r = await ipc.probeKey(key);
+      await ctx.updateSettings({ llm: { provider: r.provider, base_url: r.base_url, api_key: key.trim(), model: r.model } });
+      setKey(""); setOpen(null); ctx.toast(`Connected · ${r.model}`); finish();
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(false); }
+  };
+  const publikState = publik.state === "ready" ? "ready" : publik.state === "needs_credit" ? "needs a plan or pack" : publik.state === "unreachable" ? "unreachable right now" : publik.state === "disconnected" ? "disconnected" : "";
+
+  return (
+    <>
+      {/* publik API */}
+      <button className={"choice" + (choice === "publik" ? " selected" : "")} onClick={() => { if (publik.has_key && choice !== "publik") turnOnPublik(); else setOpen(open === "publik" ? null : "publik"); }}>
+        <div className="choice__title"><I.Sparkle style={{ width: 20, height: 20, color: "#2cc9b6" }} />publik API<span className="choice__badge">Recommended · no setup</span></div>
+        <div className="choice__desc">Already set up. No account and no key to paste. Priced per use from your publik balance, with every charge on your dashboard.</div>
+        {publik.has_key && <div className="choice__status">{choice === "publik" ? "On" : "Set up"}{publikState ? ` · ${publikState}` : ""} · {publik.balance_line}{publik.week_label ? ` · ${publik.week_label}` : ""}</div>}
+        {!publik.can_provision && !publik.has_key && <div className="choice__status" style={{ color: "#ffbf47" }}>Not available in this build.</div>}
+      </button>
+      {open === "publik" && !publik.has_key && (
+        <div className="card" style={{ marginTop: -4 }}>
+          <div className="card__title" style={{ fontSize: 15 }}>Turn on publik API?</div>
+          <p style={{ color: "var(--text-subdued)", fontSize: 14, lineHeight: 1.5, margin: "8px 0 0" }}><b>Cost.</b> {publik.disclosure.cost}</p>
+          <p style={{ color: "var(--text-subdued)", fontSize: 14, lineHeight: 1.5, margin: "8px 0 0" }}><b>Where your words go.</b> {publik.disclosure.data}</p>
+          {error && <div className="notice">{error}</div>}
+          <div className="row-actions">
+            <button className="btn btn--primary" disabled={busy || !publik.can_provision} onClick={turnOnPublik}>{busy ? "Setting up…" : "Turn on publik API"}</button>
+            <button className="btn btn--ghost" disabled={busy} onClick={() => setOpen(null)}>Not now</button>
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 10 }}>By continuing you agree to the <a href="#" onClick={(e) => { e.preventDefault(); ipc.openUrl(publik.disclosure.terms_url); }}>publik API terms</a>.</div>
+        </div>
+      )}
+      {publik.has_key && choice === "publik" && (
+        <PublikCard ctx={ctx} onDone={finish} />
+      )}
+
+      {/* Your own key */}
+      <button className={"choice" + (choice === "key" ? " selected" : "")} onClick={() => setOpen(open === "key" ? null : "key")}>
+        <div className="choice__title"><I.Lock style={{ width: 20, height: 20 }} />Your own key</div>
+        <div className="choice__desc">OpenAI, Anthropic, OpenRouter, Groq or Google. Paste the key; the provider and model are picked for you.</div>
+        {keyConnected && <div className="choice__status">Connected · {llm.model}</div>}
+      </button>
+      {open === "key" && (
+        <div className="card" style={{ marginTop: -4 }}>
+          <div className="field"><label>{keyKind(key) || "API key"}</label><input type="password" autoFocus placeholder="sk-…" value={key} onChange={(e) => setKey(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") connectKey(); }} /></div>
+          {error && <div className="notice">{error}</div>}
+          <div className="row-actions">
+            <button className="btn btn--primary" disabled={busy || !key.trim()} onClick={connectKey}>{busy ? "Checking the key…" : "Connect"}</button>
+            <button className="btn btn--ghost" disabled={busy} onClick={() => { setOpen(null); setError(null); }}>Cancel</button>
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 6 }}>The key stays on this Mac. GSpot lists your account's models and picks the best fit; change it under Advanced.</div>
+        </div>
+      )}
+
+      {mode === "onboarding" && (
+        <div className="row-actions" style={{ justifyContent: "center", marginTop: 18 }}>
+          <button className="btn btn--ghost" onClick={() => onDone?.()}>Skip for now · spelling and grammar work without AI</button>
+        </div>
+      )}
+
+      <details className="adv">
+        <summary>Advanced</summary>
+        <div className="field"><label>Provider</label><div className="select-wrap"><select className="select" value={llm.provider} onChange={(e) => {
+          const p = e.target.value as LlmConfig["provider"];
+          const base = p === "openai" ? "https://api.openai.com" : p === "anthropic" ? "https://api.anthropic.com" : "https://publikhq.com/api/v1";
+          const model = p === "openai" ? "gpt-4o-mini" : p === "anthropic" ? "claude-sonnet-5-5" : "publik-balanced";
+          ctx.updateSettings({ llm: { ...llm, provider: p, base_url: base, model } });
+        }}>
+          <option value="publik">publik API</option><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic</option>
+        </select></div></div>
+        <AdvField label="Base URL" value={llm.base_url} onSave={(v) => ctx.updateSettings({ llm: { ...llm, base_url: v } })} />
+        <AdvField label="Model" value={llm.model} onSave={(v) => ctx.updateSettings({ llm: { ...llm, model: v } })} />
+        {llm.provider !== "publik" && <AdvField label="API key" value={llm.api_key} secret onSave={(v) => ctx.updateSettings({ llm: { ...llm, api_key: v } })} />}
+        <div className="row-actions">
+          <button className="btn btn--outline" onClick={async () => { setPing("…"); try { const r = await ipc.runFeature<{ reply: string }>("ping_llm"); setPing(`OK: ${r.reply.slice(0, 40)}`); } catch (e) { setPing(String(e)); } }}>Test connection</button>
+          {ping && <span style={{ color: "var(--text-subdued)", fontSize: 13, alignSelf: "center" }}>{ping}</span>}
+        </div>
+      </details>
+    </>
+  );
+}
+
+function AdvField({ label, value, secret, onSave }: { label: string; value: string; secret?: boolean; onSave: (v: string) => void }) {
+  const [v, setV] = useState(value);
+  useEffect(() => setV(value), [value]);
+  return <div className="field"><label>{label}</label><input type={secret ? "password" : "text"} value={v} onChange={(e) => setV(e.target.value)} onBlur={() => { if (v !== value) onSave(v); }} /></div>;
+}
+
+/** The publik card under the picker: balance, the one justification, the plan button, a 402 notice with one link. */
+export function PublikCard({ ctx, onDone }: { ctx: Ctx; onDone?: () => void }) {
+  const p = ctx.publik;
+  const [confirm, setConfirm] = useState(false);
+  const act = async (f: () => Promise<unknown>) => { try { await f(); ctx.refresh(); } catch (e) { ctx.toast(String(e)); } };
+  return (
+    <div className="card" style={{ marginTop: -4, borderColor: "#1f5c50", background: "#16302b" }}>
+      {p.first_run_owed ? (
+        <>
+          <div className="card__title" style={{ fontSize: 15 }}>publik API is on</div>
+          <div style={{ fontSize: 15, fontWeight: 600, color: "#9ee8d8", marginTop: 8 }}>{p.balance_line}</div>
+          <p style={{ color: "var(--text-subdued)", fontSize: 14, lineHeight: 1.5, margin: "8px 0 0" }}>{p.justification}</p>
+          <div className="row-actions">
+            <button className="btn btn--primary" onClick={() => act(async () => { await ipc.openUrl(p.cta.url); await ipc.publikDismissFirstRun(); onDone?.(); })}>{p.cta.label}</button>
+            <button className="btn btn--ghost" onClick={() => act(async () => { await ipc.publikDismissFirstRun(); onDone?.(); })}>{p.later_label}</button>
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 8 }}>"{p.later_label}" keeps publik API on at $0.00; sign in any time from this card in Settings.</div>
+        </>
+      ) : (
+        <>
+          <div style={{ fontSize: 14, color: "#9ee8d8" }}>{p.balance_line}{p.last_charge_label ? ` · ${p.last_charge_label}` : ""}</div>
+          <p style={{ color: "var(--text-subdued)", fontSize: 13, lineHeight: 1.5, margin: "8px 0 0" }}>{p.justification}</p>
+          <div className="row-actions">
+            <button className="btn btn--primary" onClick={() => ipc.openUrl(p.cta.url)}>{p.cta.label}</button>
+            <button className="btn btn--ghost" onClick={() => ipc.openUrl(p.dashboard_url)}>Dashboard</button>
+            {confirm ? (
+              <button className="btn btn--ghost" style={{ color: "#ff9a95" }} onClick={() => act(async () => { await ipc.publikForget(); setConfirm(false); })}>Really forget this computer's key</button>
+            ) : <button className="btn btn--ghost" onClick={() => setConfirm(true)}>Turn off</button>}
+          </div>
+        </>
+      )}
+      {p.notice && (
+        <div className="notice" style={{ marginBottom: 0 }}>{p.notice.message}{p.notice.link_url && <> <a href="#" onClick={(e) => { e.preventDefault(); ipc.openUrl(p.notice!.link_url); }}>{p.notice.link_label || "Open publik"}</a></>}</div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,45 @@
+/* Design tokens lifted from Grammarly's designSystem.styles.css (dark theme values). */
+:root {
+  --bg-base: #1c1c1c;
+  --bg-subdued: #2e2e2e;
+  --bg-elevated: #242424;
+  --bg-inverse: #ffffff;
+  --border-base: #545454;
+  --border-subdued: #3a3a3a;
+  --border-f3: hsla(0, 0%, 49.8%, 0.3);
+  --text-base: #ffffff;
+  --text-subdued: #bcbcbc;
+  --text-muted: #8a8a8a;
+  --icon-base: #d9d9d9;
+  --brand: #2cc9b6;
+  --brand-strong: #15c39a;
+  --brand-dark: #027e6f;
+  --brand-subdued: #014c43;
+  --correctness: #ff7a74;
+  --correctness-strong: #eb0a00;
+  --clarity: #7d99f0;
+  --clarity-strong: #2551da;
+  --engagement: #2cc9b6;
+  --engagement-strong: #016a5e;
+  --delivery: #a598f0;
+  --delivery-strong: #5e47e5;
+  --plagiarism: #80f3f3;
+  --premium: #ffbf47;
+  --premium-text: #1c1c1c;
+  --warning: #ffbf47;
+  --link: #7ab8ff;
+  --purple-chip: #e9e3fb;
+  --purple-chip-ink: #4b3fa0;
+  --radius-1: 4px;
+  --radius-2: 8px;
+  --radius-3: 12px;
+  --radius-4: 16px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  --font-heading: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+}
