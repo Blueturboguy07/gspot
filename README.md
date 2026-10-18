@@ -34,7 +34,7 @@ See `docs/REVERSE-ENGINEERING.md` for what was learned from Grammarly Desktop an
 
 ## Install
 
-1. Download `GSpot_<version>_aarch64.dmg` from the latest GitHub release (Apple silicon Macs).
+1. Download `GSpot_<version>_aarch64.dmg` from the [latest GitHub release](https://github.com/Blueturboguy07/gspot/releases/latest) (Apple silicon Macs).
 2. Open the dmg and drag GSpot to Applications.
 3. Open GSpot. The app is signed with a Developer ID and notarized by Apple, so macOS opens it without a warning.
 4. Grant Accessibility when asked, under System Settings, Privacy & Security, Accessibility.
