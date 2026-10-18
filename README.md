@@ -45,9 +45,8 @@ default; the first use shows a two-sentence disclosure and mints a key for this 
 ## Build
 
 ```bash
-cd ui && pnpm install && cd ..
-# dev (hot reload): starts Vite + the app
-cd src-tauri && ../ui/node_modules/.bin/tauri dev
+pnpm install        # installs ui/ as well (postinstall)
+pnpm dev            # hot reload: Vite + the app
 # signed release (.app + .dmg)
 scripts/build-debug.sh                   # debug build with the publik app token compiled in (for the e2e gates)
 scripts/build-macos.sh --skip-notarize   # or with NOTARY_PROFILE / APPLE_ID+APPLE_PASSWORD+APPLE_TEAM_ID
@@ -57,7 +56,8 @@ scripts/verify-macos.sh                  # codesign, Gatekeeper, launch
 Grant Accessibility to GSpot once (System Settings → Privacy & Security → Accessibility).
 The publik app token is read from `PUBLIK_APP_TOKEN` or `~/.publik/grammarlama-app-token` at build
 time (minted with publik's `scripts/mint-app-token.mts grammarlama`); a build without it still
-offers your own key.
+offers your own key. `PUBLIK_SELF_TEST=1 /Applications/GSpot.app/Contents/MacOS/grammarlama` prints one
+line that proves the publik API wiring of a built app.
 
 ## Test
 

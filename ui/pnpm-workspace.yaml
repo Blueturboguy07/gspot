@@ -1,0 +1,6 @@
+# pnpm settings for the ui project: esbuild installs its platform binary in a build script.
+# allowBuilds is read by pnpm 12, onlyBuiltDependencies by pnpm 10.
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild
