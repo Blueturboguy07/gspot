@@ -22,10 +22,10 @@ fi
 if [ "$NOTARIZE" = 1 ] && [ -z "${APPLE_PASSWORD:-}" ]; then unset APPLE_ID APPLE_TEAM_ID 2>/dev/null || true; fi
 export APPLE_SIGNING_IDENTITY="$IDENTITY"
 # The publik app token lets a downloaded copy mint its own publik API key (src/publik.rs,
-# option_env!). It is read from the environment, else from ~/.publik/grammarlama-app-token
+# option_env!). It is read from the environment, else from ~/.publik/gspot-app-token
 # (mode 0600, written by publik's scripts/mint-app-token.mts). Never echo its value.
-if [ -z "${PUBLIK_APP_TOKEN:-}" ] && [ -s "$HOME/.publik/grammarlama-app-token" ]; then
-  PUBLIK_APP_TOKEN="$(tr -d '[:space:]' < "$HOME/.publik/grammarlama-app-token")"; export PUBLIK_APP_TOKEN
+if [ -z "${PUBLIK_APP_TOKEN:-}" ] && [ -s "$HOME/.publik/gspot-app-token" ]; then
+  PUBLIK_APP_TOKEN="$(tr -d '[:space:]' < "$HOME/.publik/gspot-app-token")"; export PUBLIK_APP_TOKEN
 fi
 if [ -z "${PUBLIK_APP_TOKEN:-}" ]; then echo "==> No PUBLIK_APP_TOKEN: this build cannot offer publik API (own key and local models still work)." >&2; else echo "==> publik app token present (compiled in)."; fi
 echo "==> Building with identity: $IDENTITY"

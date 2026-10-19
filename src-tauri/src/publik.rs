@@ -140,11 +140,17 @@ pub fn resolve_base_url(from_credential: &str) -> String {
     trim_url(from_credential).unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
-/// `~/Library/Application Support/publik/apps/grammarlama.json` (the convention
+/// `~/Library/Application Support/publik/apps/gspot.json` (the convention
 /// file Iris and the other publik apps share).
 pub fn credential_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join("Library/Application Support/publik/apps").join(format!("{APP_SLUG}.json")))
+}
+
+/// Credential file written by builds that shipped under the old slug `grammarlama`.
+fn legacy_credential_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join("Library/Application Support/publik/apps/grammarlama.json"))
 }
 
 /// The key in force: `PUBLIK_API_KEY` in the environment, else the credential file.
@@ -156,11 +162,24 @@ pub fn read_credential() -> Option<Credential> {
         }
     }
     let path = credential_path()?;
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        // A computer set up by a build that shipped under the old slug: adopt its
+        // credential once (same key, same install) and keep it at the new path.
+        Err(_) => {
+            let r = std::fs::read_to_string(legacy_credential_path()?).ok()?;
+            if let Ok(mut c) = serde_json::from_str::<Credential>(&r) {
+                c.app_slug = APP_SLUG.into();
+                let _ = write_credential(&c);
+            }
+            r
+        }
+    };
     let mut c: Credential = serde_json::from_str(&raw).ok()?;
     if !c.key.starts_with("pk_") {
         return None;
     }
+    c.app_slug = APP_SLUG.into();
     c.base_url = resolve_base_url(&c.base_url);
     if c.model.trim().is_empty() {
         c.model = DEFAULT_MODEL.into();
@@ -185,6 +204,9 @@ pub fn write_credential(c: &Credential) -> anyhow::Result<()> {
 
 pub fn forget_credential() {
     if let Some(p) = credential_path() {
+        let _ = std::fs::remove_file(p);
+    }
+    if let Some(p) = legacy_credential_path() {
         let _ = std::fs::remove_file(p);
     }
     clear_live();

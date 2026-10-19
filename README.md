@@ -56,7 +56,7 @@ scripts/verify-macos.sh                  # codesign, Gatekeeper, launch
 ```
 
 Grant Accessibility to GSpot once (System Settings → Privacy & Security → Accessibility).
-The publik app token is read from `PUBLIK_APP_TOKEN` or `~/.publik/grammarlama-app-token` at build
+The publik app token is read from `PUBLIK_APP_TOKEN` or `~/.publik/gspot-app-token` at build
 time (minted with publik's `scripts/mint-app-token.mts gspot`); a build without it still
 offers your own key. `PUBLIK_SELF_TEST=1 /Applications/GSpot.app/Contents/MacOS/grammarlama` prints one
 line that proves the publik API wiring of a built app.

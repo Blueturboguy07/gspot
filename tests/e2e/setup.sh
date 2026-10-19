@@ -25,7 +25,7 @@ if [ "$(echo "$S" | jsonq 'd["can_provision"]')" != "True" ]; then
 else
   [ "$(echo "$S" | jsonq 'd["justification"].startswith("The model") and "dashboard" in d["justification"]')" = "True" ] && pass "status carries the one justification sentence" || fail "justification: $(echo "$S" | jsonq 'd["justification"][:60]')"
   [ "$(echo "$S" | jsonq '"$0.00" in d["disclosure"]["cost"] and "$0.05" in d["disclosure"]["cost"] and "never trains" in d["disclosure"]["data"]')" = "True" ] && pass "disclosure says \$0.00 start, \$0.05 on link, no training" || fail "disclosure: $(echo "$S" | jsonq 'd["disclosure"]')"
-  CRED="$HOME/Library/Application Support/publik/apps/grammarlama.json"
+  CRED="$HOME/Library/Application Support/publik/apps/gspot.json"
   HAD_KEY=0; [ -f "$CRED" ] && HAD_KEY=1 && cp "$CRED" "$CRED.e2e-backup"
   [ "$HAD_KEY" = 1 ] && rm -f "$CRED"
   P="$(probe /publik '{"action":"provision"}' 60)"
