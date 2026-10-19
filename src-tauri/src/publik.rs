@@ -16,7 +16,7 @@ use std::time::Duration;
 pub const DEFAULT_BASE_URL: &str = "https://publikhq.com/api/v1";
 pub const DASHBOARD_URL: &str = "https://publikhq.com/dashboard/api";
 pub const TERMS_URL: &str = "https://publikhq.com/terms#api";
-pub const APP_SLUG: &str = "grammarlama";
+pub const APP_SLUG: &str = "gspot";
 pub const DISCLOSURE_VERSION: u32 = 1;
 /// The alias the gateway maps to its balanced tier: the writing quality the
 /// sidebar features need. Anonymous keys cannot use `publik-smart`.
