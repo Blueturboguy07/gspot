@@ -1,5 +1,7 @@
 # GSpot
 
+![GSpot beside a TextEdit draft: the Review panel lists the suggestions, the draft is underlined in place, and a card offers the fix](docs/hero.png)
+
 A local-first, open-source Grammarly-style writing assistant for macOS. A floating panel docked to the
 left edge of the screen follows the text field you are typing in (any app), underlines issues in place,
 and runs the full sidebar of tools: suggestions, AI chat, plagiarism, tone, performance score,
