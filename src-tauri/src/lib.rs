@@ -13,6 +13,8 @@ pub mod host;
 pub mod llm;
 pub mod overlay;
 pub mod publik;
+#[rustfmt::skip]
+mod publik_telemetry; // vendored publik telemetry v1 client, kept as published
 pub mod score;
 pub mod settings;
 pub mod textmap;
@@ -39,6 +41,9 @@ pub fn run() {
     tauri::Builder::default()
         .manage(shared.clone())
         .setup(move |app| {
+            // publik usage counts: app_opened now, active_session every 30 minutes. The client runs on
+            // its own thread and never blocks the first window. README "Usage counts" says what is sent.
+            publik_telemetry::start(publik::APP_SLUG, env!("CARGO_PKG_VERSION"), Some(Box::new(|| publik::read_credential().map(|c| c.key))));
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle().clone();

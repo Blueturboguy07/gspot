@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 (2026-11-06)
+
+Same as 0.1.0, plus usage counts.
+
+- Usage counts for publik: app opened, active session. No content is sent. Turn it off with `DO_NOT_TRACK=1`. See "Usage counts" in the README.
+
 ## 0.1.0 (2026-10-18)
 
 First release.

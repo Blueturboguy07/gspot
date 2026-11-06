@@ -44,6 +44,15 @@ GSpot is listed on [publik](https://publikhq.com/gspot).
 GSpot lives in the menu bar and as a tab on the left screen edge. AI features run through publik API by
 default; the first use shows a two-sentence disclosure and mints a key for this computer.
 
+## Usage counts
+
+GSpot sends two usage events to publik: `app_opened` at start, and `active_session` every 30 minutes
+while it runs. An event holds the app name, the app version, the operating system, the CPU type and a
+random install ID. When publik API is on, the publik key of this computer goes with it. No text, no
+file name and no personal data is sent. To turn it off, set `DO_NOT_TRACK=1` in the environment, or put
+`{"usage": false}` in `~/Library/Application Support/publik/consent.json`.
+Details: https://publikhq.com/skills/telemetry.md
+
 ## Build
 
 ```bash
