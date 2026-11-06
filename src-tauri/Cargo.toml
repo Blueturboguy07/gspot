@@ -1,6 +1,6 @@
 [package]
 name = "grammarlama"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "GSpot — a local-first Grammarly-style writing assistant for macOS"
@@ -33,6 +33,7 @@ rand = "0.8"
 scraper = "0.21"
 unicode-segmentation = "1"
 url = "2"
+ureq = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
