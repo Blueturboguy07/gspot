@@ -1,0 +1,99 @@
+# Builds the unsigned macOS app for a publik release of GSpot.
+# The release Mac signs it with the Developer ID, notarizes it and makes the dmg
+# (the same steps as scripts/build-macos.sh). This workflow never creates a release.
+name: publik-build
+
+on:
+  push:
+    branches: ['telemetry/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publik-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: macOS arm64 (unsigned app)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The versions that built the 0.1.0 release: Xcode 26.2, Rust 1.97.1, Node 24, pnpm 12.8.1.
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.2.app
+          xcodebuild -version
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+          rustc --version
+          cargo --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: pnpm
+        run: |
+          npm install -g pnpm@12.8.1
+          pnpm --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Install the UI packages
+        run: pnpm --dir ui install --frozen-lockfile
+
+      # No signing identity here: the app comes out unsigned (ad-hoc on Apple silicon).
+      # The publik app token is compiled in (src/publik.rs, option_env!), as in scripts/build-macos.sh.
+      - name: Build GSpot.app
+        env:
+          PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
+        run: |
+          if [ -z "$PUBLIK_APP_TOKEN" ]; then
+            echo "::error::The PUBLIK_APP_TOKEN secret is not set. The build would have no publik API."
+            exit 1
+          fi
+          cd src-tauri
+          ../ui/node_modules/.bin/tauri build --bundles app
+
+      - name: Check and pack the app
+        env:
+          PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
+        run: |
+          APP=src-tauri/target/release/bundle/macos/GSpot.app
+          BIN="$APP/Contents/MacOS/grammarlama"
+          test -x "$BIN"
+          ARCHS="$(lipo -archs "$BIN")"
+          echo "architectures: $ARCHS"
+          [ "$ARCHS" = "arm64" ]
+          echo "version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          # Counts only: the token value is never printed.
+          if [ "$(grep -c -a -F "$PUBLIK_APP_TOKEN" "$BIN")" -lt 1 ]; then
+            echo "::error::The publik app token is not in the binary."
+            exit 1
+          fi
+          if ! grep -q -a -F "publik-telemetry" "$BIN"; then
+            echo "::error::The telemetry client is not in the binary."
+            exit 1
+          fi
+          if ! git diff --quiet -- src-tauri/Cargo.lock; then
+            echo "::warning::Cargo.lock changed during the build."
+            git diff -- src-tauri/Cargo.lock | head -80
+          fi
+          ditto -c -k --keepParent "$APP" GSpot-unsigned-aarch64.app.zip
+          shasum -a 256 GSpot-unsigned-aarch64.app.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GSpot-macos-arm64-unsigned
+          path: GSpot-unsigned-aarch64.app.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
