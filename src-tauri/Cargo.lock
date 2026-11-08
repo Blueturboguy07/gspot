@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "grammarlama"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3097,6 +3097,7 @@ dependencies = [
  "unicode-segmentation",
  "ureq",
  "url",
+ "windows 0.61.3",
 ]
 
 [[package]]

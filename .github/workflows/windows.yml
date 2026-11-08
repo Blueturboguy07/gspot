@@ -1,0 +1,185 @@
+# Builds the GSpot Windows installer (NSIS, x64, unsigned) and tests it on clean
+# Windows runners: install, start, connect to Notepad / WordPad / an Edge text area,
+# underline, hover, accept, panel, terminal skip, uninstall. Screenshots, a desktop
+# recording and the results table are uploaded as the "e2e-<os>" artifacts.
+# This workflow never creates a release.
+name: windows
+
+on:
+  push:
+    branches: ['windows/**']
+  workflow_dispatch:
+    inputs:
+      self_test:
+        description: "Also run the publik self-test (provisions a real publik install)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # publik usage counts stay off on CI (the e2e launches the app).
+  DO_NOT_TRACK: '1'
+
+jobs:
+  build:
+    name: Build the Windows installer
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+          rustc --version
+          cargo --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: pnpm
+        run: |
+          npm install -g pnpm@12.8.1
+          pnpm --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Install the UI packages
+        run: pnpm --dir ui install --frozen-lockfile
+
+      # The Rust crate embeds ui/dist at compile time, so build the UI before the tests.
+      - name: UI tests and build
+        run: |
+          pnpm --dir ui test
+          pnpm --dir ui run build
+
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      # The publik app token is compiled in (src/publik.rs, option_env!), as on macOS.
+      - name: Build the installer
+        working-directory: src-tauri
+        shell: pwsh
+        env:
+          PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
+        run: |
+          if (-not $env:PUBLIK_APP_TOKEN) { Write-Error "The PUBLIK_APP_TOKEN secret is not set. The build would have no publik API."; exit 1 }
+          & ..\ui\node_modules\.bin\tauri.cmd build --bundles nsis
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check and checksum the installer
+        shell: pwsh
+        env:
+          PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
+        run: |
+          $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "no installer was built"; exit 1 }
+          Write-Host "installer: $($exe.Name) $([math]::Round($exe.Length / 1MB, 1)) MB"
+          $bin = Get-ChildItem src-tauri/target/release/*.exe | Where-Object { $_.Name -notlike "*build*" } | Select-Object -First 1
+          Write-Host "app binary: $($bin.Name)"
+          $bytes = [System.IO.File]::ReadAllBytes($bin.FullName)
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          # Counts only: the token value is never printed.
+          if (-not $text.Contains($env:PUBLIK_APP_TOKEN)) { Write-Error "The publik app token is not in the binary."; exit 1 }
+          if (-not $text.Contains("publik-telemetry")) { Write-Error "The telemetry client is not in the binary."; exit 1 }
+          if (git status --porcelain -- src-tauri/Cargo.lock) { Write-Warning "Cargo.lock changed during the build."; git diff -- src-tauri/Cargo.lock | Select-Object -First 80 }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe.FullName dist/
+          Get-FileHash dist/*.exe -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } | Tee-Object dist/SHA256SUMS-windows.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GSpot-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  e2e:
+    name: Test on ${{ matrix.os }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tests/e2e/windows
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: GSpot-windows-x64
+          path: dist
+
+      # Optional: a desktop recording of the whole test (session.mp4).
+      - name: ffmpeg for the recording
+        continue-on-error: true
+        timeout-minutes: 6
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Install, start and drive GSpot
+        shell: powershell
+        run: |
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + $env:Path
+          $exe = Get-ChildItem dist/*-setup.exe | Select-Object -First 1
+          $run = @("-ExecutionPolicy", "Bypass", "-File", "tests/e2e/windows/e2e.ps1", "-Installer", $exe.FullName, "-Out", "e2e-out")
+          if ("${{ inputs.self_test }}" -eq "true") { $run += "-SelfTest" }
+          & powershell @run
+          exit $LASTEXITCODE
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.os }}
+          path: e2e-out/
+          retention-days: 14
+
+  macos:
+    name: macOS unit tests (shared code)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.2.app
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: pnpm
+        run: npm install -g pnpm@12.8.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: UI build
+        run: |
+          pnpm --dir ui install --frozen-lockfile
+          pnpm --dir ui run build
+
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --locked

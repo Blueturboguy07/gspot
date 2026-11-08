@@ -1,5 +1,5 @@
-//! GSpot: a local-first Grammarly-style writing assistant for macOS.
-//! Native Tauri host + Harper engine + Accessibility overlays + LLM features.
+//! GSpot: a local-first Grammarly-style writing assistant for macOS and Windows.
+//! Native Tauri host + Harper engine + Accessibility / UI Automation overlays + LLM features.
 
 pub mod aiphrases;
 pub mod apply;
@@ -8,16 +8,19 @@ pub mod commands;
 pub mod debug_server;
 pub mod engine;
 pub mod features;
+pub mod geom;
 pub mod history;
 pub mod host;
 pub mod llm;
 pub mod overlay;
+pub mod platform;
 pub mod publik;
 #[rustfmt::skip]
 mod publik_telemetry; // vendored publik telemetry v1 client, kept as published
 pub mod score;
 pub mod settings;
 pub mod textmap;
+pub mod uia;
 
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
@@ -50,12 +53,13 @@ pub fn run() {
             overlay::create_windows(&handle, &dock_side)?;
             // Start tucked behind the edge tab, like Grammarly. First run (no
             // Accessibility yet) starts open so the permission gate is visible.
-            overlay::set_tucked(&handle, &dock_side, ax::is_trusted(), false, false);
+            overlay::set_tucked(&handle, &dock_side, platform::is_trusted(), false, false);
 
             let open = MenuItem::with_id(app, "open", "Open GSpot", true, None::<&str>)?;
             let perms = MenuItem::with_id(app, "perms", "Accessibility permission…", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit GSpot", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &perms, &quit])?;
+            // Windows needs no screen-reading permission, so its tray menu has no such item.
+            let menu = if platform::NEEDS_PERMISSION { Menu::with_items(app, &[&open, &perms, &quit])? } else { Menu::with_items(app, &[&open, &quit])? };
             let mut tray = TrayIconBuilder::with_id("main").menu(&menu).show_menu_on_left_click(true).tooltip("GSpot");
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
@@ -63,7 +67,7 @@ pub fn run() {
             tray.on_menu_event(|app, event| match event.id.as_ref() {
                 "open" => commands::open_panel_inner(app, "review", true),
                 "perms" => {
-                    ax::prompt_trust();
+                    platform::prompt_trust();
                 }
                 "quit" => app.exit(0),
                 _ => {}
@@ -72,8 +76,8 @@ pub fn run() {
 
             host::spawn(handle.clone(), shared.clone());
             debug_server::spawn(handle.clone(), shared.clone());
-            if !ax::is_trusted() {
-                ax::prompt_trust();
+            if !platform::is_trusted() {
+                platform::prompt_trust();
             }
             Ok(())
         })

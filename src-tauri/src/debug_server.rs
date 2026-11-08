@@ -41,7 +41,7 @@ pub fn spawn(app: AppHandle, shared: Shared) {
 
 fn handle(app: &AppHandle, shared: &Shared, path: &str, args: Value) -> Result<Value, String> {
     match path {
-        "/health" => Ok(json!({"ok": true, "trusted": crate::ax::is_trusted()})),
+        "/health" => Ok(json!({"ok": true, "trusted": crate::platform::is_trusted()})),
         "/state" => {
             // Window queries round-trip through the main thread; take them before
             // holding the shared lock so a main-thread command can never deadlock us.
@@ -97,9 +97,9 @@ fn handle(app: &AppHandle, shared: &Shared, path: &str, args: Value) -> Result<V
         "/mouse" => {
             // {"x","y"} moves the pointer; no args returns where it is.
             match (args["x"].as_f64(), args["y"].as_f64()) {
-                (Some(x), Some(y)) => Ok(json!({"ok": crate::ax::post_mouse_move(x, y)})),
+                (Some(x), Some(y)) => Ok(json!({"ok": crate::platform::post_mouse_move(x, y)})),
                 _ => {
-                    let (x, y) = crate::ax::mouse_location_top_left().unwrap_or((0.0, 0.0));
+                    let (x, y) = crate::platform::mouse_location().unwrap_or((0.0, 0.0));
                     Ok(json!({"x": x, "y": y}))
                 }
             }

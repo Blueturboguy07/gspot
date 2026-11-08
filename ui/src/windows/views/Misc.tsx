@@ -6,6 +6,7 @@ import { ipc } from "../../lib/ipc";
 import { relativeTime } from "../../lib/text";
 import type { Settings } from "../../lib/types";
 import { AiSetup } from "./AiSetup";
+import { IS_WINDOWS } from "../../lib/platform";
 
 export function History({ ctx }: { ctx: Ctx }) {
   return (
@@ -49,7 +50,7 @@ export function SettingsView({ ctx }: { ctx: Ctx }) {
         <p style={{ color: "var(--text-subdued)", fontSize: 13, margin: "2px 0 8px" }}>Plagiarism checks search the web through publik API when it is on, one cent a search. Paste your own key below to search with it instead.</p>
         <div className="field"><label>Brave Search API key (for plagiarism checking)</label><input type="password" placeholder="Optional" value={s.search.brave_key} onChange={(e) => setS({ ...s, search: { ...s.search, brave_key: e.target.value } })} onBlur={() => save(s)} /></div>
         <div className="section-label">App</div>
-        <div className="row-actions"><button className="btn btn--outline" onClick={() => ipc.permissionPrompt()}>Accessibility permission</button><button className="btn btn--ghost" onClick={() => ipc.quit()}>Quit GSpot</button></div>
+        <div className="row-actions">{!IS_WINDOWS && <button className="btn btn--outline" onClick={() => ipc.permissionPrompt()}>Accessibility permission</button>}<button className="btn btn--ghost" onClick={() => ipc.quit()}>Quit GSpot</button></div>
       </div>
     </>
   );

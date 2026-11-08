@@ -140,17 +140,30 @@ pub fn resolve_base_url(from_credential: &str) -> String {
     trim_url(from_credential).unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
-/// `~/Library/Application Support/publik/apps/gspot.json` (the convention
-/// file Iris and the other publik apps share).
+/// The folder all publik apps share on this computer account:
+/// `~/Library/Application Support/publik` on macOS, `%LOCALAPPDATA%\publik` on Windows.
+fn publik_root() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).filter(|p| p.is_absolute());
+        let local = local.or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("AppData").join("Local")))?;
+        Some(local.join("publik"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").ok()?;
+        Some(PathBuf::from(home).join("Library/Application Support/publik"))
+    }
+}
+
+/// `<publik folder>/apps/gspot.json` (the convention file Iris and the other publik apps share).
 pub fn credential_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join("Library/Application Support/publik/apps").join(format!("{APP_SLUG}.json")))
+    Some(publik_root()?.join("apps").join(format!("{APP_SLUG}.json")))
 }
 
 /// Credential file written by builds that shipped under the old slug `grammarlama`.
 fn legacy_credential_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join("Library/Application Support/publik/apps/grammarlama.json"))
+    Some(publik_root()?.join("apps").join("grammarlama.json"))
 }
 
 /// The key in force: `PUBLIK_API_KEY` in the environment, else the credential file.
@@ -188,17 +201,29 @@ pub fn read_credential() -> Option<Credential> {
 }
 
 pub fn write_credential(c: &Credential) -> anyhow::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = credential_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let json = serde_json::to_string_pretty(c)?;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    // %LOCALAPPDATA% is private to the Windows account already.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(&path)?;
     use std::io::Write;
     f.write_all(json.as_bytes())?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -223,15 +248,40 @@ pub fn new_install_id() -> String {
     format!("{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15])
 }
 
+/// The OS name publik's install mint expects.
+fn os_name() -> &'static str {
+    if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }
+}
+
+#[cfg(not(windows))]
 fn os_version() -> Option<String> {
     let out = std::process::Command::new("sw_vers").arg("-productVersion").output().ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if v.is_empty() { None } else { Some(v) }
 }
 
+/// "10.0.22631" from `ver` ("Microsoft Windows [Version 10.0.22631.4317]").
+#[cfg(windows)]
+fn os_version() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("cmd.exe").args(["/C", "ver"]).creation_flags(CREATE_NO_WINDOW).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let v = text.split("Version").nth(1)?.trim().trim_end_matches(']').trim();
+    let parts: Vec<&str> = v.split('.').take(3).collect();
+    if parts.is_empty() || parts[0].is_empty() { None } else { Some(parts.join(".")) }
+}
+
+#[cfg(not(windows))]
 fn device_name() -> Option<String> {
     let out = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok()?;
     let v: String = String::from_utf8_lossy(&out.stdout).trim().chars().take(120).collect();
+    if v.is_empty() { None } else { Some(v) }
+}
+
+#[cfg(windows)]
+fn device_name() -> Option<String> {
+    let v: String = std::env::var("COMPUTERNAME").ok()?.trim().chars().take(120).collect();
     if v.is_empty() { None } else { Some(v) }
 }
 
@@ -399,7 +449,7 @@ pub async fn provision(install_id: Option<String>) -> Result<Credential, PublikE
             "app_token": token,
             "app_slug": APP_SLUG,
             "app_version": env!("CARGO_PKG_VERSION"),
-            "os": "macos",
+            "os": os_name(),
             "arch": arch_name(),
             "install_id": id,
             "disclosure_version": DISCLOSURE_VERSION,

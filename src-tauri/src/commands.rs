@@ -12,7 +12,7 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn doc_snapshot(shared: &Shared) -> Option<(HostDoc, crate::ax::AXElement)> {
+fn doc_snapshot(shared: &Shared) -> Option<(HostDoc, crate::platform::Element)> {
     let st = shared.lock().unwrap();
     match (&st.doc, &st.element) {
         (Some(d), Some(e)) => Some((d.clone(), e.clone())),
@@ -27,7 +27,7 @@ pub fn accept_alert_inner(app: &AppHandle, shared: &Shared, id: &str, suggestion
     };
     let replacement = alert.suggestions.get(suggestion).cloned().ok_or("This suggestion has no automatic fix.")?;
     let (doc, el) = doc_snapshot(shared).ok_or("No text field is connected.")?;
-    let res = crate::apply::replace_range(&el, doc.pid, alert.u16_start, alert.u16_end - alert.u16_start, &replacement, &doc.text).map_err(err)?;
+    let res = crate::platform::replace_range(&el, doc.pid, alert.u16_start, alert.u16_end - alert.u16_start, &replacement, &doc.text).map_err(err)?;
     // Update the model immediately so the panel does not flicker.
     {
         let mut st = shared.lock().unwrap();
@@ -66,7 +66,7 @@ pub fn dismiss_alert_inner(app: &AppHandle, shared: &Shared, id: &str) -> Result
 pub fn replace_range_inner(app: &AppHandle, shared: &Shared, start: usize, end: usize, text: &str) -> Result<crate::apply::ApplyResult, String> {
     let (doc, el) = doc_snapshot(shared).ok_or("No text field is connected.")?;
     let end = end.max(start);
-    let res = crate::apply::replace_range(&el, doc.pid, start, end - start, text, &doc.text).map_err(err)?;
+    let res = crate::platform::replace_range(&el, doc.pid, start, end - start, text, &doc.text).map_err(err)?;
     {
         let mut st = shared.lock().unwrap();
         if let Some(d) = st.doc.as_mut() {
@@ -429,22 +429,38 @@ pub fn tuck_panel(app: AppHandle) {
 
 #[tauri::command]
 pub fn permission_prompt() -> bool {
-    crate::ax::prompt_trust()
+    crate::platform::prompt_trust()
 }
 
 #[tauri::command]
 pub fn permission_status() -> bool {
-    crate::ax::is_trusted()
+    crate::platform::is_trusted()
 }
 
 #[tauri::command]
-pub fn set_card_rects(state: State<'_, Shared>, rects: Vec<crate::ax::Rect>) {
+pub fn set_card_rects(state: State<'_, Shared>, rects: Vec<crate::geom::Rect>) {
     state.lock().unwrap().card_rects = rects;
 }
 
 #[tauri::command]
 pub fn open_url(url: String) {
+    open_url_inner(&url);
+}
+
+/// Open a link or settings page with the system's handler.
+pub fn open_url_inner(url: &str) {
+    #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(windows)]
+    {
+        // url.dll hands the URL to the default browser without a shell, so
+        // `&` in a query string is not read as a command separator.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).creation_flags(CREATE_NO_WINDOW).spawn();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 #[tauri::command]

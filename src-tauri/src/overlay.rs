@@ -24,6 +24,33 @@ static ANIM_GEN: AtomicU64 = AtomicU64::new(0);
 /// Where the panel was when it tucked, so untuck brings it back there.
 static LAST_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
+/// Show an overlay window (edge tab, G button, underlines) without taking
+/// focus from the app the user is typing in. On Windows a shown window can
+/// still activate, so the foreground goes back to that app if it moved to us.
+pub fn show_passive(w: &tauri::WebviewWindow) {
+    #[cfg(windows)]
+    {
+        let before = crate::uia::foreground();
+        let _ = w.show();
+        let ours = w.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+        if before == 0 || before == ours {
+            return;
+        }
+        // show() lands on the UI thread a moment later.
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(20));
+            if crate::uia::foreground() == ours {
+                crate::uia::set_foreground(before);
+                return;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = w.show();
+    }
+}
+
 pub fn is_tucked() -> bool {
     TUCKED.load(Ordering::SeqCst)
 }
@@ -105,7 +132,7 @@ pub fn set_tucked(app: &AppHandle, side: &str, tucked: bool, animate: bool, focu
             if let Some(t) = &tab {
                 let (x, y, _, _) = tab_rect(&app, &side);
                 let _ = t.set_position(tauri::Position::Logical(LogicalPosition::new(x, y)));
-                let _ = t.show();
+                show_passive(t);
             }
         } else {
             if let Some(t) = &tab {

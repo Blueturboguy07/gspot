@@ -2,7 +2,7 @@
 
 ![GSpot beside a TextEdit draft: the Review panel lists the suggestions, the draft is underlined in place, and a card offers the fix](docs/hero.png)
 
-A local-first, open-source Grammarly-style writing assistant for macOS. A floating panel docked to the
+A local-first, open-source Grammarly-style writing assistant for macOS and Windows. A floating panel docked to the
 left edge of the screen follows the text field you are typing in (any app), underlines issues in place,
 and runs the full sidebar of tools: suggestions, AI chat, plagiarism, tone, performance score,
 paraphraser, humanizer, reader reactions, translate, explain it, AI rewriter, AI detector.
@@ -15,11 +15,18 @@ tucks into the left. `dock_side` in Settings flips it.)
 * Correctness engine: [Harper](https://writewithharper.com) (`harper-core`, in-process, offline).
   A sentence over 40 words gets a "Split the long sentence" card with a lossless split ready to accept;
   the spot check (the model) replaces it with a better split when one passes the guards.
-* Text access: the macOS Accessibility API (focused field, selection, `AXBoundsForRange` geometry).
-  Terminals (Terminal, iTerm2, Warp, Ghostty, kitty, Alacritty, WezTerm, Hyper) are skipped: a shell
-  transcript is not writing. Any other app can be skipped from the Review view ("Skip this app") and
-  turned back on under Settings → Skipped apps.
-* Replacements: AX selected-text set, then a verified pasteboard patch fallback.
+* Text access: the macOS Accessibility API (focused field, selection, `AXBoundsForRange` geometry),
+  and on Windows UI Automation (`src-tauri/src/uia.rs`: the focused Edit/Document element, its
+  TextPattern text, selection and `GetBoundingRectangles` geometry). `src-tauri/src/platform.rs` is
+  the one interface the host loop uses on both.
+  Terminals (Terminal, iTerm2, Warp, Ghostty, kitty, Alacritty, WezTerm, Hyper; Windows Terminal,
+  cmd, PowerShell, ConEmu, mintty and others) are skipped: a shell transcript is not writing. Any
+  other app can be skipped from the Review view ("Skip this app") and turned back on under
+  Settings → Skipped apps.
+* Replacements: AX selected-text set, then a verified pasteboard patch fallback. On Windows: the
+  edit control's own select-and-replace messages (Notepad, WordPad, other Win32 edit and rich-edit
+  fields), then a UI Automation selection plus a verified Ctrl+V paste (browsers, Office), then the
+  field's UI Automation value for plain fields.
 * AI features: **publik API** by default (no account, no key: the app mints its own key on this
   computer after a two-sentence disclosure; you sign in with publik to add free use or a plan),
   or your own key (paste it; OpenAI, Anthropic, OpenRouter, Groq and Google are detected from the
@@ -38,13 +45,25 @@ See `docs/REVERSE-ENGINEERING.md` for what was learned from Grammarly Desktop an
 
 GSpot is listed on [publik](https://publikhq.com/gspot).
 
-1. Download `GSpot_<version>_aarch64.dmg` from the [latest GitHub release](https://github.com/Blueturboguy07/gspot/releases/latest) (Apple silicon Macs).
+**macOS** (Apple silicon):
+
+1. Download `GSpot_<version>_aarch64.dmg` from the [latest GitHub release](https://github.com/Blueturboguy07/gspot/releases/latest).
 2. Open the dmg and drag GSpot to Applications.
 3. Open GSpot. The app is signed with a Developer ID and notarized by Apple, so macOS opens it without a warning.
 4. Grant Accessibility when asked, under System Settings, Privacy & Security, Accessibility.
 
-GSpot lives in the menu bar and as a tab on the left screen edge. AI features run through publik API by
-default; the first use shows a two-sentence disclosure and mints a key for this computer.
+**Windows** (10 and 11, x64):
+
+1. Download `GSpot_<version>_x64-setup.exe` from the [latest GitHub release](https://github.com/Blueturboguy07/gspot/releases/latest).
+2. Run it. The installer is not code-signed yet, so SmartScreen may say "Windows protected your PC":
+   click **More info**, then **Run anyway**. It installs for your account only (no admin prompt) into
+   `%LOCALAPPDATA%\GSpot`, with a Start menu shortcut.
+3. Open GSpot. Windows needs no permission for it to read the text field you type in.
+   (It cannot read apps that run as administrator unless GSpot does too.)
+
+GSpot lives in the menu bar (macOS) or the notification area (Windows), and as a tab on the left
+screen edge. AI features run through publik API by default; the first use shows a two-sentence
+disclosure and mints a key for this computer.
 
 ## Usage counts
 
@@ -52,7 +71,8 @@ GSpot sends two usage events to publik: `app_opened` at start, and `active_sessi
 while it runs. An event holds the app name, the app version, the operating system, the CPU type and a
 random install ID. When publik API is on, the publik key of this computer goes with it. No text, no
 file name and no personal data is sent. To turn it off, set `DO_NOT_TRACK=1` in the environment, or put
-`{"usage": false}` in `~/Library/Application Support/publik/consent.json`.
+`{"usage": false}` in `~/Library/Application Support/publik/consent.json` (Windows:
+`%LOCALAPPDATA%\publik\consent.json`).
 Details: https://publikhq.com/skills/telemetry.md
 
 ## Build
@@ -65,6 +85,11 @@ scripts/build-debug.sh                   # debug build with the publik app token
 scripts/build-macos.sh --skip-notarize   # or with NOTARY_PROFILE / APPLE_ID+APPLE_PASSWORD+APPLE_TEAM_ID
 scripts/verify-macos.sh                  # codesign, Gatekeeper, launch
 ```
+
+Windows: `.github/workflows/windows.yml` builds `GSpot_<version>_x64-setup.exe` (NSIS, per-user,
+`tauri build --bundles nsis`) on a Windows runner with the `PUBLIK_APP_TOKEN` secret, runs the unit
+tests there, and then runs `tests/e2e/windows/e2e.ps1` on clean Windows Server 2022 and 2025 runners
+(see Test).
 
 Grant Accessibility to GSpot once (System Settings → Privacy & Security → Accessibility).
 The publik app token is read from `PUBLIK_APP_TOKEN` or `~/.publik/gspot-app-token` at build
@@ -83,6 +108,14 @@ tests/e2e/spotcheck.sh                     # the 14-document spot-check corpus t
 tests/tuning/live_corpus.sh                # the same corpus through the pipeline alone (no app windows)
 tests/e2e/setup.sh                         # publik API provisioning, own-key probe, the rig's Ollama
 ```
+
+Windows: `tests/e2e/windows/e2e.ps1 -Installer GSpot_<version>_x64-setup.exe` installs the app
+silently, starts it with the debug probe, and drives Notepad (Win32 edit control), WordPad (rich
+edit) where the OS still has it, and a Microsoft Edge text area: text read, underline position checked
+against the editor's own UI Automation rectangle, hover card, a real click on the card's Accept,
+Accept through the probe, the no-model spot check, the panel, the terminal skip, and uninstall. It
+saves a screenshot at each step and, with ffmpeg on the PATH, a desktop recording. It types and
+clicks, so it runs only on a disposable runner (the `windows` workflow).
 
 The e2e scripts launch the debug binary with `GRAMMARLAMA_DEBUG_PORT=47331` and talk to a loopback
 probe (`/state`, `/accept`, `/feature`, `/lint`). `start_app` then points the app at the rig's Ollama

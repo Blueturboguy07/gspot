@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.2 (2026-11-08)
+
+GSpot for Windows.
+
+- Windows 10 and 11 (x64) installer, `GSpot_0.1.2_x64-setup.exe`. It installs for your account only, with no admin prompt. It is not code-signed yet, so SmartScreen asks once ("More info", then "Run anyway").
+- On Windows, GSpot reads the text field you type in through UI Automation and needs no permission. Underlines, the hover card, Accept, the panel, the edge tab and every sidebar tool work as on macOS.
+- Accept on Windows uses the field's own select-and-replace first (Notepad, WordPad, other standard edit fields), so Ctrl+Z undoes it and the clipboard is untouched. Browsers and Office get a verified paste.
+- Terminals on Windows (Windows Terminal, cmd, PowerShell and others) are skipped, as on macOS.
+- macOS: no change in behavior. The macOS code moved behind one platform interface (`platform.rs`) that both systems share.
+
 ## 0.1.1 (2026-11-06)
 
 Same as 0.1.0, plus usage counts.

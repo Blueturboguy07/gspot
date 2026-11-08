@@ -9,7 +9,7 @@ export function Onboarding({ ctx }: { ctx: Ctx }) {
   return (
     <div className="panel__scroll">
       <Hero icon={<I.Sparkle />} title="Choose how GSpot thinks">
-        <p>Spelling and grammar run on this Mac. The sidebar's AI tools (chat, paraphrase, spot check, tone and more) need a model. Pick one now; you can change it any time in Settings.</p>
+        <p>Spelling and grammar run on this computer. The sidebar's AI tools (chat, paraphrase, spot check, tone and more) need a model. Pick one now; you can change it any time in Settings.</p>
       </Hero>
       <AiSetup ctx={ctx} mode="onboarding" onDone={done} />
     </div>

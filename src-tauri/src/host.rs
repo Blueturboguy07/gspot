@@ -1,9 +1,7 @@
 //! The host loop: watches the focused text field of whatever app is in front,
 //! keeps the document model, runs the engine, and computes underline geometry.
 
-#![cfg(target_os = "macos")]
-
-use crate::ax::{self, AXElement, Rect};
+use crate::platform::{self, Element, Rect};
 use crate::engine::{Alert, Engine};
 use crate::score;
 use crate::settings::Settings;
@@ -12,11 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
-pub const OUR_BUNDLE: &str = "com.publik.grammarlama";
+pub const OUR_BUNDLE: &str = platform::OUR_APP_ID;
 
 /// Apps whose text view is not a writing surface. A terminal shows its whole
-/// transcript as one AXTextArea, so every line of it would be linted and
-/// underlined (and the G button would sit on the shell).
+/// transcript as one text area, so every line of it would be linted and
+/// underlined (and the G button would sit on the shell). macOS bundle ids,
+/// then Windows exe names (lower case, as `platform::frontmost_app` reports them).
 pub const BUILT_IN_SKIP: &[&str] = &[
     "com.apple.Terminal",
     "com.googlecode.iterm2",
@@ -29,6 +28,24 @@ pub const BUILT_IN_SKIP: &[&str] = &[
     "com.mitchellh.ghostty",
     "co.zeit.hyper",
     "com.apple.Console",
+    "windowsterminal.exe",
+    "openconsole.exe",
+    "conhost.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "powershell_ise.exe",
+    "wezterm-gui.exe",
+    "alacritty.exe",
+    "mintty.exe",
+    "hyper.exe",
+    "conemu.exe",
+    "conemu64.exe",
+    "tabby.exe",
+    "warp.exe",
+    "putty.exe",
+    "kitty.exe",
+    "ghostty.exe",
 ];
 
 pub fn built_in_skip(bundle_id: &str) -> bool {
@@ -110,7 +127,7 @@ pub struct Geometry {
 #[derive(Default)]
 pub struct HostState {
     pub doc: Option<HostDoc>,
-    pub element: Option<AXElement>,
+    pub element: Option<Element>,
     pub alerts: Vec<Alert>,
     pub all_alerts: Vec<Alert>,
     /// Sentence-level suggestions from the spot check (LLM), kept across Harper re-lints.
@@ -157,49 +174,17 @@ fn hash_text(s: &str) -> u64 {
     h.finish()
 }
 
-fn is_editable(el: &AXElement, role: &str) -> bool {
-    if role == "AXSecureTextField" {
-        return false;
-    }
-    if matches!(role, "AXTextArea" | "AXTextField" | "AXComboBox" | "AXSearchField") {
-        return true;
-    }
-    if role == "AXWebArea" || role == "AXWindow" || role == "AXApplication" {
-        return false;
-    }
-    el.has_attr("AXSelectedTextRange") && el.is_settable("AXValue")
-}
-
-fn visible_frame(el: &AXElement, frame: Rect) -> Rect {
-    let mut vis = frame;
-    if let Some(sa) = el.enclosing_scroll_area() {
-        if let Some(f) = sa.frame() {
-            if let Some(i) = vis.intersect(&f) {
-                vis = i;
-            }
-        }
-    }
-    if let Some(w) = el.window() {
-        if let Some(f) = w.frame() {
-            if let Some(i) = vis.intersect(&f) {
-                vis = i;
-            }
-        }
-    }
-    vis
-}
-
 pub fn spawn(app: AppHandle, shared: Shared) {
     std::thread::Builder::new()
         .name("host-loop".into())
         .spawn(move || {
             let mut engine = Engine::new();
-            let system = AXElement::system_wide();
+            let watcher = platform::Watcher::new();
             let mut last_geom_sig = String::new();
             let mut last_status_sig = String::new();
             loop {
                 let t0 = Instant::now();
-                tick(&app, &shared, &system, &mut engine, &mut last_geom_sig, &mut last_status_sig);
+                tick(&app, &shared, &watcher, &mut engine, &mut last_geom_sig, &mut last_status_sig);
                 let spent = t0.elapsed();
                 if spent < POLL {
                     std::thread::sleep(POLL - spent);
@@ -209,11 +194,11 @@ pub fn spawn(app: AppHandle, shared: Shared) {
         .expect("host loop thread");
 }
 
-fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engine, last_geom_sig: &mut String, last_status_sig: &mut String) {
-    let trusted = ax::is_trusted();
-    let front = ax::frontmost_app();
+fn tick(app: &AppHandle, shared: &Shared, watcher: &platform::Watcher, engine: &mut Engine, last_geom_sig: &mut String, last_status_sig: &mut String) {
+    let trusted = platform::is_trusted();
+    let front = platform::frontmost_app();
     let (front_pid, front_bid, front_name) = front.clone().unwrap_or((0, String::new(), String::new()));
-    let ours = front_bid == OUR_BUNDLE;
+    let ours = front_bid == OUR_BUNDLE || front_pid == std::process::id() as i32;
 
     let (paused, skipped, built_in) = shared
         .lock()
@@ -221,14 +206,9 @@ fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engin
         .unwrap_or((false, false, false));
 
     // 1. Resolve the focused editable element (unless we are in front: keep the last one).
-    let mut focused: Option<(AXElement, String)> = None;
+    let mut focused: Option<(Element, String)> = None;
     if trusted && !ours && !paused && !skipped {
-        if let Some(el) = system.focused_element() {
-            let role = el.role().unwrap_or_default();
-            if el.pid() != std::process::id() as i32 && is_editable(&el, &role) {
-                focused = Some((el, role));
-            }
-        }
+        focused = watcher.focused_editable();
     }
 
     let mut doc_event: Option<HostDoc> = None;
@@ -276,12 +256,12 @@ fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engin
                 alerts_event = Some(vec![]);
             }
             st.lost_focus_at = None;
-            let text = el.string("AXValue").unwrap_or_default();
+            let text = platform::text(&el).unwrap_or_default();
             let truncated = text.chars().count() > MAX_CHARS;
             let text: String = if truncated { text.chars().take(MAX_CHARS).collect() } else { text };
-            let (sel_start, sel_len) = el.range("AXSelectedTextRange").unwrap_or((0, 0));
+            let (sel_start, sel_len) = platform::selection(&el).unwrap_or((0, 0));
             let frame = el.frame().unwrap_or_default();
-            let visible = visible_frame(&el, frame);
+            let visible = platform::visible_frame(&el, frame);
             let h = hash_text(&text);
             let changed = h != st.last_text_hash;
             let selected_text = crate::textmap::slice_utf16(&text, sel_start, sel_start + sel_len);
@@ -428,7 +408,7 @@ fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engin
             let mut geometry = Geometry { origin_x: vis.x, origin_y: vis.y, width: vis.w, height: vis.h, rects: vec![], hovered: None, over_card: false };
             if big_enough && show_underlines {
                 for a in alerts.iter().take(80) {
-                    for r in rects_for_range(&el, a.u16_start, a.u16_end.saturating_sub(a.u16_start).max(1)) {
+                    for r in platform::rects_for_range(&el, a.u16_start, a.u16_end.saturating_sub(a.u16_start).max(1)) {
                         if let Some(c) = r.intersect(&vis) {
                             geometry.rects.push(UnderlineRect {
                                 id: a.id.clone(),
@@ -446,7 +426,7 @@ fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engin
             }
             // hover detection
             let mut over_card = false;
-            if let Some((mx, my)) = ax::mouse_location_top_left() {
+            if let Some((mx, my)) = platform::mouse_location() {
                 let lx = mx - vis.x;
                 let ly = my - vis.y;
                 for r in &geometry.rects {
@@ -470,7 +450,7 @@ fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engin
                     let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize::new(vis.w.max(1.0), vis.h.max(1.0))));
                     let _ = w.set_ignore_cursor_events(!(geometry.hovered.is_some() || over_card));
                     if !w.is_visible().unwrap_or(false) {
-                        let _ = w.show();
+                        crate::overlay::show_passive(&w);
                     }
                 } else if w.is_visible().unwrap_or(false) {
                     let _ = w.hide();
@@ -482,7 +462,7 @@ fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engin
                     let y = vis.y + vis.h - GBUTTON - GBUTTON_INSET;
                     let _ = w.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
                     if !w.is_visible().unwrap_or(false) {
-                        let _ = w.show();
+                        crate::overlay::show_passive(&w);
                     }
                 } else if w.is_visible().unwrap_or(false) {
                     let _ = w.hide();
@@ -514,67 +494,6 @@ fn tick(app: &AppHandle, shared: &Shared, system: &AXElement, engine: &mut Engin
     }
 }
 
-/// Screen rects (one per visual line) for a UTF-16 range.
-fn rects_for_range(el: &AXElement, loc: usize, len: usize) -> Vec<Rect> {
-    let mut out = Vec::new();
-    if len == 0 {
-        return out;
-    }
-    let first = el.line_for_index(loc);
-    let last = el.line_for_index(loc + len - 1);
-    if let (Some(l0), Some(l1)) = (first, last) {
-        if l1 > l0 && l1 - l0 <= 40 {
-            for line in l0..=l1 {
-                if let Some((ls, ll)) = el.range_for_line(line) {
-                    let s = loc.max(ls);
-                    let e = (loc + len).min(ls + ll);
-                    if e > s {
-                        if let Some(r) = el.bounds_for_range(s, e - s) {
-                            if !r.is_empty() {
-                                out.push(r);
-                            }
-                        }
-                    }
-                }
-            }
-            if !out.is_empty() {
-                return out;
-            }
-        }
-    }
-    if let Some(r) = el.bounds_for_range(loc, len) {
-        if !r.is_empty() {
-            out.push(r);
-            return out;
-        }
-    }
-    // Some text views answer an empty rect for a range that wraps lines (a
-    // whole sentence): walk the range in short pieces and keep each piece's box.
-    if len > 24 {
-        let mut s = loc;
-        while s < loc + len {
-            let e = (s + 24).min(loc + len);
-            if let Some(r) = el.bounds_for_range(s, e - s) {
-                if !r.is_empty() {
-                    match out.last_mut() {
-                        Some(last) if (last.y - r.y).abs() < 2.0 && r.x >= last.x => {
-                            let right = (r.x + r.w).max(last.x + last.w);
-                            last.w = right - last.x;
-                            last.h = last.h.max(r.h);
-                        }
-                        _ => out.push(r),
-                    }
-                }
-            }
-            s = e;
-        }
-        if out.is_empty() {
-            log::debug!("no AX bounds for range {loc}+{len}");
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +504,9 @@ mod tests {
         assert!(skipped_app("com.apple.Terminal", &s));
         assert!(skipped_app("com.googlecode.iterm2", &s));
         assert!(built_in_skip("com.mitchellh.ghostty"));
+        assert!(skipped_app("windowsterminal.exe", &s));
+        assert!(skipped_app("powershell.exe", &s));
+        assert!(!skipped_app("notepad.exe", &s));
         assert!(!skipped_app("com.apple.Notes", &s));
         assert!(!skipped_app("", &s), "no app in front is not a skip");
         s.skip_apps.push(crate::settings::SkipApp { bundle_id: "com.apple.Notes".into(), name: "Notes".into() });

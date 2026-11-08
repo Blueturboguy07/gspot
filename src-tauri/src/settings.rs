@@ -128,13 +128,14 @@ impl Default for Settings {
 
 fn default_user_name() -> String {
     // macOS keeps the account's full name ("Mann Bellani"); `id -F` prints it.
+    #[cfg(target_os = "macos")]
     if let Ok(out) = std::process::Command::new("id").arg("-F").output() {
         let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if full.split_whitespace().count() >= 1 && full.len() <= 60 && !full.is_empty() {
             return full;
         }
     }
-    std::env::var("USER").map(|u| {
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).map(|u| {
         let mut c = u.chars();
         match c.next() {
             Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),

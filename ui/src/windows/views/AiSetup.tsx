@@ -95,7 +95,7 @@ export function AiSetup({ ctx, mode, onDone }: { ctx: Ctx; mode: "onboarding" | 
             <button className="btn btn--primary" disabled={busy || !key.trim()} onClick={connectKey}>{busy ? "Checking the key…" : "Connect"}</button>
             <button className="btn btn--ghost" disabled={busy} onClick={() => { setOpen(null); setError(null); }}>Cancel</button>
           </div>
-          <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 6 }}>The key stays on this Mac. GSpot lists your account's models and picks the best fit; change it under Advanced.</div>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 6 }}>The key stays on this computer. GSpot lists your account's models and picks the best fit; change it under Advanced.</div>
         </div>
       )}
 
