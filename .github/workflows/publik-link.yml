@@ -1,0 +1,97 @@
+# Installs GSpot on a clean Windows runner from the publik listing's own link
+# (https://publikhq.com/api/download/gspot), then runs the full Windows e2e on that file.
+# The link needs a signed-in publik account: the GSPOT_LINK_COOKIE secret holds one
+# short-lived test session. It is made just before a run and signed out and deleted after.
+name: publik-link
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset:
+        description: Windows asset name on the listing
+        required: true
+        default: GSpot_0.2.0_x64-setup.exe
+      tag:
+        description: Release tag that must hold the same file
+        required: true
+        default: v0.2.0
+
+permissions:
+  contents: read
+
+env:
+  DO_NOT_TRACK: '1'
+
+jobs:
+  link:
+    name: Install from publikhq.com on windows-2025
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tests/e2e/windows
+
+      - name: The listing offers the Windows file
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force e2e-out | Out-Null
+          $page = (Invoke-WebRequest -Uri "https://publikhq.com/gspot" -UseBasicParsing).Content
+          $page | Set-Content e2e-out/listing.html -Encoding UTF8
+          $asset = "${{ inputs.asset }}"
+          $m = [regex]::Match($page, '\\"name\\":\\"' + [regex]::Escape($asset) + '\\"[^}]*?\\"platform\\":\\"(\w+)\\"')
+          if (-not $m.Success) { Write-Error "publikhq.com/gspot does not list $asset"; exit 1 }
+          Write-Host "listing: $asset, platform $($m.Groups[1].Value)"
+          if ($m.Groups[1].Value -ne "windows") { Write-Error "the listing gives $asset platform '$($m.Groups[1].Value)'"; exit 1 }
+
+      - name: Download through the publik link
+        shell: pwsh
+        env:
+          GSPOT_LINK_COOKIE: ${{ secrets.GSPOT_LINK_COOKIE }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not $env:GSPOT_LINK_COOKIE) { Write-Error "GSPOT_LINK_COOKIE is not set"; exit 1 }
+          $asset = "${{ inputs.asset }}"
+          $link = "https://publikhq.com/api/download/gspot?asset=$asset"
+          # The publik link answers with a redirect to the file. Read it without following.
+          $h = New-Object System.Net.Http.HttpClientHandler
+          $h.AllowAutoRedirect = $false
+          $c = New-Object System.Net.Http.HttpClient($h)
+          $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $link)
+          $req.Headers.TryAddWithoutValidation("Cookie", $env:GSPOT_LINK_COOKIE) | Out-Null
+          $res = $c.SendAsync($req).GetAwaiter().GetResult()
+          $to = $res.Headers.Location
+          Write-Host "publik link: HTTP $([int]$res.StatusCode) -> $($to.Host)$($to.AbsolutePath)"
+          if ([int]$res.StatusCode -ne 302 -or -not $to) { Write-Error "the publik link did not redirect to a file"; exit 1 }
+          if ($to.AbsolutePath -like "/gspot*") { Write-Error "the publik link sent us to sign in: the test session is not valid"; exit 1 }
+          if (-not $to.AbsolutePath.EndsWith("/$asset")) { Write-Error "the publik link points at another file: $($to.AbsolutePath)"; exit 1 }
+          New-Item -ItemType Directory -Force dl | Out-Null
+          Invoke-WebRequest -Uri $to.AbsoluteUri -OutFile "dl/$asset" -UseBasicParsing
+          $got = (Get-FileHash "dl/$asset" -Algorithm SHA256).Hash.ToLower()
+          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p SHA256SUMS.txt -D sums
+          $want = (Get-Content sums/SHA256SUMS.txt | Where-Object { $_ -match [regex]::Escape($asset) + '$' } | Select-Object -First 1).Split(" ")[0]
+          Write-Host "sha256 from the link: $got"
+          Write-Host "sha256 in the release: $want"
+          if ($got -ne $want) { Write-Error "the file from the publik link is not the release file"; exit 1 }
+          "link=$($to.Host)$($to.AbsolutePath)`nsha256=$got" | Set-Content e2e-out/link.txt
+
+      - name: ffmpeg for the recording
+        continue-on-error: true
+        timeout-minutes: 6
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Install, start and drive GSpot
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + $env:Path
+          $exe = Get-ChildItem dl/*-setup.exe | Select-Object -First 1
+          & powershell -ExecutionPolicy Bypass -File tests/e2e/windows/e2e.ps1 -Installer $exe.FullName -Out e2e-out
+          exit $LASTEXITCODE
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: publik-link-windows-2025
+          path: e2e-out/
+          retention-days: 14

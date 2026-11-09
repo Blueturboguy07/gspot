@@ -26,7 +26,9 @@ $Installer = (Resolve-Path $Installer).Path
 $script:results = New-Object System.Collections.ArrayList
 $script:hardFails = 0
 
+Write-Host "e2e: start $(Get-Date -Format o)"
 Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient, UIAutomationTypes
+Write-Host "e2e: assemblies loaded"
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -43,6 +45,35 @@ public static class W {
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
   public delegate bool EnumProc(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, int m, IntPtr w, System.Text.StringBuilder l);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  public static string ClassOf(IntPtr h) { var sb = new System.Text.StringBuilder(128); GetClassName(h, sb, 128); return sb.ToString(); }
+  // WM_GETTEXT of a window (the system copies the text across processes).
+  public static string GetText(IntPtr h) {
+    int n = (int)SendMessage(h, 0x000E, IntPtr.Zero, IntPtr.Zero);
+    var sb = new System.Text.StringBuilder(n + 1);
+    SendMessage(h, 0x000D, (IntPtr)(n + 1), sb);
+    return sb.ToString();
+  }
+  static int[] Pos(IntPtr h, int i) {
+    long r = (long)SendMessage(h, 0x00D6, (IntPtr)i, IntPtr.Zero);
+    if (r == -1) return null;
+    var p = new POINT { X = (short)(r & 0xFFFF), Y = (short)((r >> 16) & 0xFFFF) };
+    ClientToScreen(h, ref p);
+    return new int[] { p.X, p.Y };
+  }
+  // Screen rect {x, y, w, h} of characters i..i+n of a classic edit control, by EM_POSFROMCHAR.
+  public static int[] EditRect(IntPtr h, int i, int n) {
+    var a = Pos(h, i); var b = Pos(h, i + n);
+    if (a == null) return null;
+    int lh = 16;
+    int l1 = (int)SendMessage(h, 0x00BB, (IntPtr)1, IntPtr.Zero);
+    if (l1 > 0) { var p0 = Pos(h, 0); var p1 = Pos(h, l1); if (p0 != null && p1 != null && p1[1] > p0[1]) lh = p1[1] - p0[1]; }
+    int w = (b != null && b[1] == a[1]) ? b[0] - a[0] : 8 * n;
+    return new int[] { a[0], a[1], w, lh };
+  }
   // The first descendant window whose class is a Win32 edit or rich-edit control.
   public static IntPtr FindEditor(IntPtr top) {
     IntPtr found = IntPtr.Zero;
@@ -119,19 +150,27 @@ function Wait-Until([scriptblock]$Cond, [int]$Seconds = 30) {
 
 function State { return Probe "/state" }
 
-# The editor of a top-level window: its Win32 edit / rich-edit child, else the first
-# Edit or Document element UI Automation finds.
+# The editor of a top-level window: its Win32 edit / rich-edit child (with its UI
+# Automation element), else the first Edit or Document element UI Automation finds.
+# A classic "Edit" child is read and measured with its own window messages: the
+# managed UI Automation client in Windows PowerShell sees it as a bare pane.
 function Find-Editor([IntPtr]$hwnd) {
   $child = [W]::FindEditor($hwnd)
-  if ($child -ne [IntPtr]::Zero) { return $UIA::FromHandle($child) }
+  if ($child -ne [IntPtr]::Zero) {
+    return [pscustomobject]@{ Hwnd = $child; Class = [W]::ClassOf($child); El = $UIA::FromHandle($child) }
+  }
   $root = $UIA::FromHandle($hwnd)
   $cond = New-Object System.Windows.Automation.OrCondition(
     (New-Object System.Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, $CT::Edit)),
     (New-Object System.Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, $CT::Document)))
-  return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+  $el = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+  if (-not $el) { return $null }
+  return [pscustomobject]@{ Hwnd = [IntPtr]::Zero; Class = $el.Current.ClassName; El = $el }
 }
 
-function Get-EditorText($el) {
+function Get-EditorText($ed) {
+  if ($ed.Class -eq "Edit") { return [W]::GetText($ed.Hwnd) }
+  $el = $ed.El
   $tp = $null
   if ($el.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$tp)) { return $tp.DocumentRange.GetText(-1) }
   $vp = $null
@@ -140,7 +179,15 @@ function Get-EditorText($el) {
 }
 
 # Screen rectangle of the first occurrence of $word, measured by the editor's own text provider.
-function Find-WordRect($el, [string]$word) {
+function Find-WordRect($ed, [string]$word) {
+  if ($ed.Class -eq "Edit") {
+    $i = ([W]::GetText($ed.Hwnd)).IndexOf($word)
+    if ($i -lt 0) { return $null }
+    $r = [W]::EditRect($ed.Hwnd, $i, $word.Length)
+    if (-not $r) { return $null }
+    return [pscustomobject]@{ X = $r[0]; Y = $r[1]; Width = $r[2]; Height = $r[3] }
+  }
+  $el = $ed.El
   $tp = $null
   if (-not $el.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$tp)) { return $null }
   $r = $tp.DocumentRange.FindText($word, $false, $false)
@@ -201,14 +248,23 @@ function Click-Element($el) {
 function Focus-Editor($proc, $editor) {
   [void][W]::Focus($proc.MainWindowHandle)
   Start-Sleep -Milliseconds 300
-  try { $editor.SetFocus() } catch { }
-  $b = $editor.Current.BoundingRectangle
+  try { $editor.El.SetFocus() } catch { }
+  $b = $editor.El.Current.BoundingRectangle
   [W]::Click([int]($b.Left + 30), [int]($b.Bottom - 20))
   Start-Sleep -Milliseconds 300
 }
 
 # --- 0. Screen and recording ---------------------------------------------------------
-try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop; Log "display set to 1920x1080" } catch { Log "display resolution unchanged: $($_.Exception.Message)" }
+Write-Host "e2e: helpers compiled"
+# Set the screen to 1920x1080 when it is smaller, in a job with a time limit (the
+# setting tool can stall on some images).
+$cur = [System.Windows.Forms.SystemInformation]::VirtualScreen
+if ($cur.Width -lt 1920 -or $cur.Height -lt 1080) {
+  $job = Start-Job { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop }
+  if (Wait-Job $job -Timeout 20) { try { Receive-Job $job -ErrorAction Stop | Out-Null; Log "display set to 1920x1080" } catch { Log "display resolution unchanged: $($_.Exception.Message)" } }
+  else { Stop-Job $job; Log "display resolution unchanged: the setting did not finish in 20 s" }
+  Remove-Job $job -Force -ErrorAction SilentlyContinue
+}
 $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
 Note "screen" "$($vs.Width)x$($vs.Height), $([System.Environment]::OSVersion.VersionString)"
 $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
@@ -271,7 +327,7 @@ try {
   Start-Sleep -Milliseconds 600
   $editor = Find-Editor $npw.MainWindowHandle
   if (-not $editor) { Fail "Notepad editor found" "no Edit/Document element"; throw "no editor" }
-  Note "Notepad editor" "class $($editor.Current.ClassName), type $($editor.Current.ControlType.ProgrammaticName)"
+  Note "Notepad editor" "class $($editor.Class), UI Automation type $($editor.El.Current.ControlType.ProgrammaticName)"
   Focus-Editor $npw $editor
 
   $doc = Wait-Until { $s = State; if ($s.doc -and $s.doc.bundle_id -eq "notepad.exe" -and @($s.alerts).Count -ge 3) { return $s } } 30
@@ -357,7 +413,8 @@ try {
     $r = Probe "/accept" @{ id = $spot.id }
     Start-Sleep -Milliseconds 400
     $now = Get-EditorText $editor
-    if ($r.method -and $now -notlike "*In order to be able to*") { Pass "accepting the rewrite changes Notepad" "line 2 now: '$(($now -split "`r`n")[1])'" } else { Fail "accept spot rewrite" "result $($r | ConvertTo-Json -Compress) text '$now'" }
+    $want = @($spot.suggestions)[0]
+    if ($r.method -and $now -and $now -notlike "*In order to be able to*" -and $now.Contains($want)) { Pass "accepting the rewrite changes Notepad" "line 2 now: '$(($now -split "`r`n")[1])'" } else { Fail "accept spot rewrite" "result $($r | ConvertTo-Json -Compress) text '$now'" }
   } else { Fail "spot check" "result $($r | ConvertTo-Json -Compress)" }
 
   # Panel: first run shows the AI picker; after that the Review list.

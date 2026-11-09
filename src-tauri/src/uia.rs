@@ -24,7 +24,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use windows::core::{Interface, BSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTONEAREST, RGN_OR};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTONEAREST, RGN_OR};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, SAFEARRAY};
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData};
@@ -36,7 +36,7 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SETSEL};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_V};
-use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SendMessageTimeoutW, SetCursorPos, SetForegroundWindow, GA_ROOT, SMTO_ABORTIFHUNG};
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SendMessageTimeoutW, SetCursorPos, SetForegroundWindow, GA_ROOT, SMTO_ABORTIFHUNG};
 
 /// Text-unit conventions a provider may use for `TextUnit_Character`; found
 /// per element by probing (see `detect_mode`).
@@ -361,6 +361,7 @@ impl Watcher {
                 }
             };
             let class = class_name(hwnd_of(native));
+            log::info!("focused field: pid {pid}, class {class:?}, role {role}, text pattern {}, value pattern {}", tp.is_some(), vp.is_some());
             let inner = Inner { el, tp, vp, pid, runtime_id, native, top, class, mode: AtomicU8::new(MODE_UNKNOWN), last_text: Mutex::new(String::new()) };
             let found = (Element(Arc::new(inner)), role.to_string());
             *self.last.borrow_mut() = Some(found.clone());
@@ -426,6 +427,12 @@ impl Element {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.0.runtime_id.hash(&mut h);
         h.finish()
+    }
+
+    /// A classic Win32 edit control (not rich edit): its own messages answer
+    /// selection and layout when UI Automation has no text pattern for it.
+    fn is_classic_edit(&self) -> bool {
+        self.0.native != 0 && self.0.class.eq_ignore_ascii_case("edit")
     }
 
     pub fn frame(&self) -> Option<Rect> {
@@ -514,6 +521,10 @@ pub fn text(el: &Element) -> Option<String> {
 
 /// `(location, length)` of the selection in UTF-16 units of `text(el)`.
 pub fn selection(el: &Element) -> Option<(usize, usize)> {
+    selection_uia(el).or_else(|| if el.is_classic_edit() { edit_selection(el.0.native) } else { None })
+}
+
+fn selection_uia(el: &Element) -> Option<(usize, usize)> {
     let tp = el.0.tp.as_ref()?;
     unsafe {
         let sel = tp.GetSelection().ok()?;
@@ -549,9 +560,99 @@ pub fn rects_for_range(el: &Element, loc: usize, len: usize) -> Vec<Rect> {
         return vec![];
     }
     let text = el.0.last_text.lock().unwrap().clone();
-    let Some(r) = el.range_utf16(&text, loc, len) else { return vec![] };
-    let nums: Vec<f64> = unsafe { r.GetBoundingRectangles().map(|p| take_safearray::<f64>(p)).unwrap_or_default() };
-    nums.chunks_exact(4).map(|c| logical(c[0], c[1], c[2], c[3])).filter(|r| !r.is_empty()).collect()
+    let from_uia: Vec<Rect> = match el.range_utf16(&text, loc, len) {
+        Some(r) => {
+            let nums: Vec<f64> = unsafe { r.GetBoundingRectangles().map(|p| take_safearray::<f64>(p)).unwrap_or_default() };
+            nums.chunks_exact(4).map(|c| logical(c[0], c[1], c[2], c[3])).filter(|r| !r.is_empty()).collect()
+        }
+        None => vec![],
+    };
+    if from_uia.is_empty() && el.is_classic_edit() {
+        return edit_rects(el.0.native, text.encode_utf16().count(), loc, len);
+    }
+    from_uia
+}
+
+// Classic Win32 edit control messages (winuser.h). The system marshals these
+// across processes; each answer is a plain value, no pointers.
+const EM_GETSEL: u32 = 0x00B0;
+const EM_GETLINECOUNT: u32 = 0x00BA;
+const EM_LINEINDEX: u32 = 0x00BB;
+const EM_LINELENGTH: u32 = 0x00C1;
+const EM_LINEFROMCHAR: u32 = 0x00C9;
+const EM_POSFROMCHAR: u32 = 0x00D6;
+
+/// The selection of a classic edit control (its own character indexes, which
+/// are the UTF-16 units of its text, CR LF counted as two).
+fn edit_selection(h: isize) -> Option<(usize, usize)> {
+    let r = send_message(h, EM_GETSEL, 0, 0)? as isize;
+    if r == -1 {
+        return None; // 64K or more: the packed answer cannot say
+    }
+    let (start, end) = ((r & 0xFFFF) as usize, ((r >> 16) & 0xFFFF) as usize);
+    (end >= start).then_some((start, end - start))
+}
+
+/// Client position of character `i` of a classic edit control (None past the end).
+fn edit_pos(h: isize, i: usize) -> Option<(i32, i32)> {
+    let r = send_message(h, EM_POSFROMCHAR, i, 0)? as isize;
+    if r == -1 {
+        return None;
+    }
+    Some(((r & 0xFFFF) as u16 as i16 as i32, ((r >> 16) & 0xFFFF) as u16 as i16 as i32))
+}
+
+/// Screen rects (one per line) for characters `loc..loc+len` of a classic edit
+/// control, from the control's own layout: for fields whose UI Automation
+/// provider has no text pattern (classic Notepad on Windows Server 2022/2025).
+fn edit_rects(h: isize, text_len: usize, loc: usize, len: usize) -> Vec<Rect> {
+    if h == 0 || len == 0 || loc + len > text_len {
+        return vec![];
+    }
+    let line_of = |i: usize| send_message(h, EM_LINEFROMCHAR, i, 0);
+    let lines = send_message(h, EM_GETLINECOUNT, 0, 0).unwrap_or(1).max(1);
+    let line_top = |l: usize| -> Option<i32> { edit_pos(h, send_message(h, EM_LINEINDEX, l, 0)?).map(|p| p.1) };
+    // Line height: the distance between two neighbouring lines, else the client height (one-line field).
+    let mut client = RECT::default();
+    let _ = unsafe { GetClientRect(hwnd_of(h), &mut client) };
+    let lh = if lines > 1 {
+        match (line_top(0), line_top(1)) {
+            (Some(a), Some(b)) if b > a => b - a,
+            _ => 16,
+        }
+    } else {
+        (client.bottom - client.top).clamp(8, 40)
+    };
+    let (Some(first), Some(last)) = (line_of(loc), line_of(loc + len - 1)) else { return vec![] };
+    let mut out = Vec::new();
+    for l in first..=last.min(first + 50) {
+        let Some(ls) = send_message(h, EM_LINEINDEX, l, 0) else { continue };
+        let ll = send_message(h, EM_LINELENGTH, ls, 0).unwrap_or(0);
+        let (s, e) = (loc.max(ls), (loc + len).min(ls + ll));
+        if e <= s {
+            continue;
+        }
+        let Some((x0, y0)) = edit_pos(h, s) else { continue };
+        // Right edge: where the next character starts on this line; else the last
+        // character's start plus the average width of the span.
+        let x1 = match edit_pos(h, e) {
+            Some((x, y)) if y == y0 && x > x0 => x,
+            _ => {
+                let lx = edit_pos(h, e - 1).map(|p| p.0).unwrap_or(x0);
+                let avg = if e - s > 1 { ((lx - x0) as f64 / (e - s - 1) as f64).round() as i32 } else { 8 };
+                lx + avg.max(4)
+            }
+        };
+        let mut p = POINT { x: x0, y: y0 };
+        if !unsafe { ClientToScreen(hwnd_of(h), &mut p) }.as_bool() {
+            continue;
+        }
+        let r = logical(p.x as f64, p.y as f64, (x1 - x0) as f64, lh as f64);
+        if !r.is_empty() {
+            out.push(r);
+        }
+    }
+    out
 }
 
 fn verified(el: &Element, loc: usize, replacement: &str) -> Option<String> {

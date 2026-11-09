@@ -135,6 +135,8 @@ jobs:
 
       - name: Install, start and drive GSpot
         shell: powershell
+        # A step limit (not only the job limit), so the results still upload after a stall.
+        timeout-minutes: 20
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + $env:Path
           $exe = Get-ChildItem dist/*-setup.exe | Select-Object -First 1
