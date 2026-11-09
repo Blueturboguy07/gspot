@@ -1,6 +1,6 @@
 [package]
 name = "grammarlama"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "GSpot — a local-first Grammarly-style writing assistant for macOS and Windows"
@@ -41,7 +41,8 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication", "NSEvent", "NSScreen", "NSApplication", "NSResponder", "NSWindow", "NSGraphics"] }
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSGeometry", "NSProcessInfo"] }
 
-# The same windows-rs version Tauri's own Windows code uses, so it is built once.
+# windows-rs for UI Automation and Win32. Tauri itself uses 0.62; this crate uses 0.61
+# (also already in the lock file through other Tauri dependencies).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
   "Win32_Foundation",

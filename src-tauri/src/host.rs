@@ -448,7 +448,16 @@ fn tick(app: &AppHandle, shared: &Shared, watcher: &platform::Watcher, engine: &
                 if big_enough && show_underlines {
                     let _ = w.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(vis.x, vis.y)));
                     let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize::new(vis.w.max(1.0), vis.h.max(1.0))));
+                    #[cfg(not(windows))]
                     let _ = w.set_ignore_cursor_events(!(geometry.hovered.is_some() || over_card));
+                    #[cfg(windows)]
+                    {
+                        // The drawn underline strips (the UI paints 2-3 pt at the bottom of each
+                        // rect) plus the open card; everything else belongs to the app below.
+                        let mut shape: Vec<Rect> = geometry.rects.iter().map(|r| Rect { x: r.x - 1.0, y: r.y + r.h - 4.0, w: r.w + 2.0, h: 6.0 }).collect();
+                        shape.extend(card_rects.iter().copied());
+                        crate::overlay::set_shape(&w, &shape);
+                    }
                     if !w.is_visible().unwrap_or(false) {
                         crate::overlay::show_passive(&w);
                     }

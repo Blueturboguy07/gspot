@@ -51,6 +51,16 @@ pub fn show_passive(w: &tauri::WebviewWindow) {
     }
 }
 
+/// Windows: clip the underline layer to `rects` (window-local logical points);
+/// see `uia::set_window_shape`.
+#[cfg(windows)]
+pub fn set_shape(w: &tauri::WebviewWindow, rects: &[crate::geom::Rect]) {
+    let Ok(h) = w.hwnd() else { return };
+    let s = w.scale_factor().unwrap_or(1.0);
+    let px: Vec<(i32, i32, i32, i32)> = rects.iter().map(|r| ((r.x * s).floor() as i32, (r.y * s).floor() as i32, (r.w * s).ceil() as i32, (r.h * s).ceil() as i32)).collect();
+    crate::uia::set_window_shape(h.0 as isize, &px);
+}
+
 pub fn is_tucked() -> bool {
     TUCKED.load(Ordering::SeqCst)
 }
@@ -172,7 +182,17 @@ pub fn panel_state(app: &AppHandle) -> serde_json::Value {
         })
         .unwrap_or((false, 0.0, 0.0));
     let tab_visible = app.get_webview_window("tab").map(|w| w.is_visible().unwrap_or(false)).unwrap_or(false);
-    json!({"tucked": is_tucked(), "visible": visible, "x": x, "y": y, "tab_visible": tab_visible})
+    let overlay = |label: &str| {
+        app.get_webview_window(label)
+            .map(|w| {
+                let (x, y) = logical_pos(&w).unwrap_or((0.0, 0.0));
+                let s = w.scale_factor().unwrap_or(1.0);
+                let (ww, hh) = w.outer_size().map(|z| (z.width as f64 / s, z.height as f64 / s)).unwrap_or((0.0, 0.0));
+                json!({"visible": w.is_visible().unwrap_or(false), "x": x, "y": y, "w": ww, "h": hh})
+            })
+            .unwrap_or(json!(null))
+    };
+    json!({"tucked": is_tucked(), "visible": visible, "x": x, "y": y, "tab_visible": tab_visible, "underlines": overlay("underlines"), "gbutton": overlay("gbutton")})
 }
 
 pub fn dock_panel(app: &AppHandle, side: &str) {
@@ -252,6 +272,11 @@ pub fn create_windows(app: &AppHandle, side: &str) -> tauri::Result<()> {
         .visible_on_all_workspaces(true)
         .visible(false)
         .build()?;
+    // macOS: click-through until the host sees the pointer on an underline or the card.
+    // Windows: the host gives the window the shape of the underlines and the card instead.
+    #[cfg(not(windows))]
     let _ = u.set_ignore_cursor_events(true);
+    #[cfg(windows)]
+    set_shape(&u, &[]);
     Ok(())
 }

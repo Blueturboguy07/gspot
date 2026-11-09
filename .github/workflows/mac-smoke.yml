@@ -1,0 +1,83 @@
+# Opens a release's signed dmg on a clean macOS runner the way a download would be opened:
+# quarantine flag, Gatekeeper, copy to /Applications, start, debug probe. Screenshots are
+# uploaded as the "mac-smoke" artifact. Runs on GitHub, never on a desk Mac.
+name: mac-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag whose dmg to test (a draft release works)
+        required: true
+
+permissions:
+  contents: write # read draft releases
+
+env:
+  DO_NOT_TRACK: '1'
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Download the dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p "*.dmg" -D dl
+          ls -l dl
+
+      - name: Gatekeeper, install, start
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          DMG="$(ls dl/*.dmg | head -1)"
+          xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" "$DMG"
+          spctl -a -vv -t open --context context:primary-signature "$DMG" 2>&1 | tee out/spctl-dmg.txt
+          xcrun stapler validate "$DMG"
+          MNT="$(mktemp -d)"
+          hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "$MNT" "$DMG" >/dev/null
+          ditto "$MNT/GSpot.app" /Applications/GSpot.app
+          hdiutil detach "$MNT" -quiet
+          xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" /Applications/GSpot.app
+          spctl -a -vv -t exec /Applications/GSpot.app 2>&1 | tee out/spctl-app.txt
+          grep -q "source=Notarized Developer ID" out/spctl-app.txt
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/GSpot.app/Contents/Info.plist | tee out/version.txt
+          GRAMMARLAMA_DEBUG_PORT=47331 /Applications/GSpot.app/Contents/MacOS/grammarlama > out/gspot.log 2>&1 &
+          echo $! > out/pid
+          for i in $(seq 1 60); do
+            if curl -s -X POST http://127.0.0.1:47331/health > out/health.json 2>/dev/null && grep -q '"ok":true' out/health.json; then break; fi
+            sleep 1
+          done
+          cat out/health.json; echo
+
+      - name: Probe checks
+        run: |
+          set -euo pipefail
+          P=http://127.0.0.1:47331
+          for i in $(seq 1 40); do
+            curl -s -X POST $P/state > out/state.json
+            python3 -c 'import json,sys; d=json.load(open("out/state.json")); sys.exit(0 if len(d["ui_ready"])>=4 else 1)' && break
+            sleep 1
+          done
+          python3 - <<'PY'
+          import json
+          d = json.load(open("out/state.json"))
+          print("ui_ready:", d["ui_ready"])
+          print("panel:", d["panel"])
+          assert set(d["ui_ready"]) >= {"panel", "gbutton", "underlines", "tab"}, d["ui_ready"]
+          PY
+          curl -s -X POST $P/lint -d '{"text":"I has teh cat."}' > out/lint.json
+          python3 -c 'import json; d=json.load(open("out/lint.json")); a=[x["original"] for x in d["alerts"]]; print("lint:", a); assert "teh" in a'
+          curl -s -X POST $P/panel -d '{"tucked":false,"view":"review"}' > /dev/null
+          sleep 2
+          screencapture -x out/panel.png || echo "screencapture unavailable"
+          curl -s -X POST $P/state | python3 -c 'import json,sys; d=json.load(sys.stdin); print("panel:", d["panel"]); assert d["panel"]["visible"]'
+          kill "$(cat out/pid)" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-smoke
+          path: out/

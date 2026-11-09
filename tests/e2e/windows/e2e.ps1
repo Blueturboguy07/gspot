@@ -10,7 +10,7 @@
   Written for Windows PowerShell 5.1 (UI Automation from .NET Framework).
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File tests\e2e\windows\e2e.ps1 -Installer GSpot_0.1.2_x64-setup.exe -Out e2e-out
+  powershell -ExecutionPolicy Bypass -File tests\e2e\windows\e2e.ps1 -Installer GSpot_0.2.0_x64-setup.exe -Out e2e-out
 #>
 param(
   [Parameter(Mandatory = $true)] [string] $Installer,
@@ -40,6 +40,20 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool r);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+  // The first descendant window whose class is a Win32 edit or rich-edit control.
+  public static IntPtr FindEditor(IntPtr top) {
+    IntPtr found = IntPtr.Zero;
+    EnumChildWindows(top, (h, l) => {
+      var sb = new System.Text.StringBuilder(128); GetClassName(h, sb, 128);
+      var c = sb.ToString();
+      if (c == "Edit" || c.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase)) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
   public static uint FgPid() { uint p; GetWindowThreadProcessId(GetForegroundWindow(), out p); return p; }
   public static void Click(int x, int y) {
     SetCursorPos(x, y); System.Threading.Thread.Sleep(120);
@@ -105,8 +119,11 @@ function Wait-Until([scriptblock]$Cond, [int]$Seconds = 30) {
 
 function State { return Probe "/state" }
 
-# The first Edit or Document element of a top-level window, through UI Automation.
+# The editor of a top-level window: its Win32 edit / rich-edit child, else the first
+# Edit or Document element UI Automation finds.
 function Find-Editor([IntPtr]$hwnd) {
+  $child = [W]::FindEditor($hwnd)
+  if ($child -ne [IntPtr]::Zero) { return $UIA::FromHandle($child) }
   $root = $UIA::FromHandle($hwnd)
   $cond = New-Object System.Windows.Automation.OrCondition(
     (New-Object System.Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, $CT::Edit)),
@@ -143,6 +160,42 @@ function Find-Window([string]$processName, [int]$Seconds = 20) {
 function Alert-By([string]$original) {
   $s = State
   return @($s.alerts | Where-Object { $_.original -eq $original -and @($_.suggestions).Count -gt 0 }) | Select-Object -First 1
+}
+
+# Share of pixels along a horizontal line of the screen that are clearly colored
+# (an underline), not the white page or black text.
+function Colored-Share([int]$x, [int]$y, [int]$w) {
+  $bmp = New-Object System.Drawing.Bitmap $w, 1
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($x, $y, 0, 0, $bmp.Size)
+  $n = 0
+  for ($i = 0; $i -lt $w; $i++) { $c = $bmp.GetPixel($i, 0); if ($c.GetSaturation() -gt 0.35 -and $c.GetBrightness() -gt 0.2 -and $c.GetBrightness() -lt 0.9) { $n++ } }
+  $g.Dispose(); $bmp.Dispose()
+  return [math]::Round($n / [math]::Max(1, $w), 2)
+}
+
+# The best "Accept"/"Dismiss" button in GSpot's own windows, nearest a screen point.
+# (Web content in WebView2 belongs to msedgewebview2.exe, so search under GSpot's
+# top-level windows rather than by process id.)
+function Find-CardButton([string]$name, [double]$nearX, [double]$nearY) {
+  $wins = $UIA::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($UIA::ProcessIdProperty, $app.Id)))
+  $named = New-Object System.Windows.Automation.PropertyCondition($UIA::NameProperty, $name)
+  $all = foreach ($w in $wins) { $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $named) }
+  return @($all | Where-Object { $_ } | Sort-Object { $r = $_.Current.BoundingRectangle; [math]::Abs($r.Left - $nearX) + [math]::Abs($r.Top - $nearY) }) | Select-Object -First 1
+}
+
+# Hover an alert's underline with the real pointer; returns the state once the card is open.
+function Hover-Alert($alert) {
+  $s = State
+  $ur = @($s.geometry.rects | Where-Object { $_.id -eq $alert.id }) | Select-Object -First 1
+  if (-not $ur) { return $null }
+  [void][W]::SetCursorPos([int]($s.geometry.origin_x + $ur.x + $ur.w / 2), [int]($s.geometry.origin_y + $ur.y + $ur.h / 2))
+  return Wait-Until { $t = State; if ($t.geometry.hovered -eq $alert.id -and @($t.card_rects).Count -gt 0) { return $t } } 8
+}
+
+function Click-Element($el) {
+  $bb = $el.Current.BoundingRectangle
+  [W]::Click([int]($bb.Left + $bb.Width / 2), [int]($bb.Top + $bb.Height / 2))
 }
 
 function Focus-Editor($proc, $editor) {
@@ -231,6 +284,17 @@ try {
   $geo = Wait-Until { $s = State; if (@($s.geometry.rects).Count -ge 3) { return $s } } 15
   $s = State
   if ($geo) { Pass "underline geometry" "$(@($s.geometry.rects).Count) rects; field at ($($s.geometry.origin_x), $($s.geometry.origin_y)) $($s.geometry.width)x$($s.geometry.height)" } else { Fail "underline geometry" "rects=$(@($s.geometry.rects).Count)" }
+  $s | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $Out "state-notepad.json") -Encoding UTF8
+  $ul = $s.panel.underlines
+  if ($ul.visible -and [math]::Abs($ul.x - $s.geometry.origin_x) -le 2 -and [math]::Abs($ul.y - $s.geometry.origin_y) -le 2) { Pass "underline layer shown over the field" "at ($($ul.x), $($ul.y)) $($ul.w)x$($ul.h)" } else { Fail "underline layer shown over the field" ($ul | ConvertTo-Json -Compress) }
+  Start-Sleep -Milliseconds 500
+  $drawn = 0
+  foreach ($r in @($s.geometry.rects | Where-Object { -not $_.sentence })) {
+    $share = Colored-Share ([int]($s.geometry.origin_x + $r.x)) ([int]($s.geometry.origin_y + $r.y + $r.h - 1)) ([int][math]::Max(4, $r.w))
+    if ($share -ge 0.5) { $drawn++ }
+  }
+  $words = @($s.geometry.rects | Where-Object { -not $_.sentence }).Count
+  if ($drawn -ge 1 -and $drawn -ge $words - 1) { Pass "underlines drawn on screen" "$drawn of $words word underlines found in screen pixels" } else { Fail "underlines drawn on screen" "$drawn of $words word underlines found in screen pixels" }
 
   # GSpot's rect for "tomorow" (third line, after two CR LF) against Notepad's own measurement.
   $a = Alert-By "tomorow"
@@ -252,33 +316,38 @@ try {
   if ($r.method -and $now -like "*files tomorrow.*") { Pass "accept 'tomorow' -> 'tomorrow' changes Notepad" "method $($r.method)" } else { Fail "accept in Notepad" "result $($r | ConvertTo-Json -Compress) text '$now'" }
 
   # Hover the "recieve" underline with the real pointer, then click Accept on the card.
-  $s = Wait-Until { $s = State; $x = Alert-By "recieve"; if ($x -and @($s.geometry.rects | Where-Object { $_.id -eq $x.id }).Count -gt 0) { return $s } } 10
+  [void](Wait-Until { $x = Alert-By "recieve"; $t = State; if ($x -and @($t.geometry.rects | Where-Object { $_.id -eq $x.id }).Count -gt 0) { return $t } } 10)
   $a = Alert-By "recieve"
-  $s = State
-  $ur = @($s.geometry.rects | Where-Object { $_.id -eq $a.id }) | Select-Object -First 1
-  if ($ur) {
-    [void][W]::SetCursorPos([int]($s.geometry.origin_x + $ur.x + $ur.w / 2), [int]($s.geometry.origin_y + $ur.y + $ur.h / 2))
-    $hov = Wait-Until { $s = State; if ($s.geometry.hovered -eq $a.id -and @($s.card_rects).Count -gt 0) { return $s } } 8
-    if ($hov) { Pass "hovering the underline opens the suggestion card" "card at $(($hov.card_rects | Select-Object -First 1) | ConvertTo-Json -Compress)" } else { $s = State; Fail "hover card" "hovered=$($s.geometry.hovered) card_rects=$(@($s.card_rects).Count)" }
+  $hov = if ($a) { Hover-Alert $a } else { $null }
+  if ($hov) {
+    Pass "hovering the underline opens the suggestion card" "card at $(($hov.card_rects | Select-Object -First 1) | ConvertTo-Json -Compress)"
+    Start-Sleep -Milliseconds 400
     Shot "03-hover-card"
-    # Web content in WebView2 belongs to msedgewebview2.exe, so look inside GSpot's
-    # own top-level windows and take the Accept button nearest the underline.
-    $ux = $s.geometry.origin_x + $ur.x; $uy = $s.geometry.origin_y + $ur.y
-    $btn = Wait-Until {
-      $wins = $UIA::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($UIA::ProcessIdProperty, $app.Id)))
-      $named = New-Object System.Windows.Automation.PropertyCondition($UIA::NameProperty, "Accept")
-      $all = foreach ($w in $wins) { $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $named) }
-      @($all | Where-Object { $_ } | Sort-Object { $r = $_.Current.BoundingRectangle; [math]::Abs($r.Left - $ux) + [math]::Abs($r.Top - $uy) }) | Select-Object -First 1
-    } 10
+    $btn = Wait-Until { Find-CardButton "Accept" ($hov.geometry.origin_x) ($hov.geometry.origin_y) } 10
     if ($btn) {
-      $bb = $btn.Current.BoundingRectangle
-      [W]::Click([int]($bb.Left + $bb.Width / 2), [int]($bb.Top + $bb.Height / 2))
+      Click-Element $btn
       $ok = Wait-Until { $t = Get-EditorText $editor; if ($t -like "*will receive the files*") { return $t } } 8
       if ($ok) { Pass "clicking Accept on the card changes Notepad" "'recieve' -> 'receive'" } else { Fail "card Accept click" "text '$(Get-EditorText $editor)'" }
-      if ([W]::FgPid() -eq $npw.Id) { Pass "Notepad still has the focus after the card click" "" } else { Fail "focus after card click" "foreground pid $([W]::FgPid())" }
+      if ([W]::FgPid() -eq $npw.Id) { Pass "Notepad keeps the focus after the card click" "" } else { Fail "focus after card click" "foreground pid $([W]::FgPid())" }
     } else { Fail "card Accept button" "not found through UI Automation" }
-  } else { Fail "hover" "no rect for 'recieve'" }
-  [void][W]::SetCursorPos(1000, 700)
+  } else { $t = State; Fail "hover card" "alert=$([bool]$a) hovered=$($t.geometry.hovered) card_rects=$(@($t.card_rects).Count)" }
+  [void][W]::SetCursorPos(1000, 900)
+  Start-Sleep -Milliseconds 800
+
+  # Dismiss "Teh" from its card: the alert goes away, the text stays, the choice is saved.
+  $a = Wait-Until { $x = Alert-By "Teh"; $t = State; if ($x -and @($t.geometry.rects | Where-Object { $_.id -eq $x.id }).Count -gt 0) { return $x } } 10
+  $hov = if ($a) { Hover-Alert $a } else { $null }
+  if ($hov) {
+    $btn = Wait-Until { Find-CardButton "Dismiss" ($hov.geometry.origin_x) ($hov.geometry.origin_y) } 10
+    if ($btn) {
+      Click-Element $btn
+      $gone = Wait-Until { $t = State; if (-not @($t.alerts | Where-Object { $_.original -eq "Teh" })) { return $t } } 8
+      $set = Probe "/settings"
+      $txt = Get-EditorText $editor
+      if ($gone -and $txt -like "*Teh end.*" -and (@($set.dismissed) | ForEach-Object { "$_" }) -contains "$($a.stable_hash)") { Pass "Dismiss on the card hides the alert and keeps the text" "'Teh' left as written; saved in settings" } else { Fail "card Dismiss" "gone=$([bool]$gone) text '$txt' dismissed=$(@($set.dismissed) -join ',')" }
+    } else { Fail "card Dismiss button" "not found through UI Automation" }
+  } else { Fail "hover for dismiss" "alert=$([bool]$a)" }
+  [void][W]::SetCursorPos(1000, 900)
 
   # Spot check with no model: the deterministic wordy-phrase rewrite on line 2.
   $r = Probe "/feature" @{ name = "spot_check"; args = @{} }
@@ -295,7 +364,8 @@ try {
   [void](Probe "/panel" @{ tucked = $false; view = "review" })
   Start-Sleep -Milliseconds 1500
   $s = State
-  if ($s.panel.visible -and -not $s.panel.tucked) { Pass "panel slides out" "at ($($s.panel.x), $($s.panel.y))" } else { Fail "panel slides out" ($s.panel | ConvertTo-Json -Compress) }
+  if ($s.panel.visible -and -not $s.panel.tucked -and $s.panel.x -ge 0 -and $s.panel.x -le 40) { Pass "panel slides out, docked on the left" "at ($($s.panel.x), $($s.panel.y))" } else { Fail "panel slides out, docked on the left" ($s.panel | ConvertTo-Json -Compress) }
+  if ([W]::FgPid() -eq $npw.Id) { Pass "Notepad keeps the focus while the panel is out" "" } else { Note "focus while the panel is out" "foreground pid $([W]::FgPid())" }
   Shot "04-panel-first-run"
   [void](Probe "/settings" @{ onboarded = $true })
   [void](Probe "/panel" @{ view = "review" })
@@ -347,17 +417,17 @@ try {
       if ($doc) {
         Pass "Edge text area connected and linted" "$(@($doc.alerts).Count) alerts, role $($doc.doc.role)"
         $g = Wait-Until { $s = State; if (@($s.geometry.rects).Count -ge 2) { return $s } } 10
-        if ($g) { Pass "Edge underline geometry" "$(@($g.geometry.rects).Count) rects" } else { SoftFail "Edge underline geometry" "no rects" }
+        if ($g) { Pass "Edge underline geometry" "$(@($g.geometry.rects).Count) rects" } else { Fail "Edge underline geometry" "no rects" }
         Shot "07-edge-underlines"
         $a = Alert-By "tomorow"
         $r = Probe "/accept" @{ id = $a.id }
         Start-Sleep -Milliseconds 600
         $s = State
-        if ($r.method -and $s.doc.text -like "*files tomorrow.*") { Pass "accept in Edge" "method $($r.method)" } else { SoftFail "accept in Edge" "result $($r | ConvertTo-Json -Compress) text '$($s.doc.text)'" }
-      } else { $s = State; SoftFail "Edge text area connected" "front=$($s.status.frontmost_bid) doc=$($s.doc.bundle_id) alerts=$(@($s.alerts).Count)"; Shot "fail-edge" }
+        if ($r.method -and $s.doc.text -like "*files tomorrow.*") { Pass "accept in Edge" "method $($r.method)" } else { Fail "accept in Edge" "result $($r | ConvertTo-Json -Compress) text '$($s.doc.text)'" }
+      } else { $s = State; Fail "Edge text area connected" "front=$($s.status.frontmost_bid) doc=$($s.doc.bundle_id) alerts=$(@($s.alerts).Count)"; Shot "fail-edge" }
       Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    } else { SoftFail "Edge opens" "no window" }
-  } else { Note "Edge" "not installed" }
+    } else { Fail "Edge opens" "no window" }
+  } else { Fail "Edge" "not installed" }
 
   # --- 7. Terminals are skipped -----------------------------------------------------
   $cmd = Start-Process cmd.exe -ArgumentList "/k", "echo GSpot stays out of terminals" -PassThru
@@ -365,7 +435,7 @@ try {
   $cw = Wait-Until { Get-Process -Id $cmd.Id -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } } 10
   if ($cw) { [void][W]::Focus($cw.MainWindowHandle) }
   $sk = Wait-Until { $s = State; if ($s.status.skipped) { return $s } } 10
-  if ($sk) { Pass "terminal skipped" "front app $($sk.status.frontmost_bid), built in: $($sk.status.skip_built_in)" } else { $s = State; SoftFail "terminal skipped" "front=$($s.status.frontmost_bid) skipped=$($s.status.skipped)" }
+  if ($sk) { Pass "terminal skipped" "front app $($sk.status.frontmost_bid), built in: $($sk.status.skip_built_in)" } else { $s = State; Fail "terminal skipped" "front=$($s.status.frontmost_bid) skipped=$($s.status.skipped)" }
   Shot "08-terminal-skipped"
   Stop-Process -Id $cmd.Id -Force -ErrorAction SilentlyContinue
   Get-Process WindowsTerminal -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -378,8 +448,8 @@ try {
   if (Test-Path $un) {
     Start-Process $un -ArgumentList "/S" -Wait
     $gone = Wait-Until { -not (Test-Path $exe.FullName) } 30
-    if ($gone) { Pass "silent uninstall removes the app" "" } else { SoftFail "uninstall" "$($exe.FullName) still there" }
-  } else { SoftFail "uninstaller" "no uninstall.exe in $dir" }
+    if ($gone) { Pass "silent uninstall removes the app" "" } else { Fail "uninstall" "$($exe.FullName) still there" }
+  } else { Fail "uninstaller" "no uninstall.exe in $dir" }
 } catch {
   Log "stopped early: $_"
   if ($script:hardFails -eq 0) { Fail "harness" "$_" }

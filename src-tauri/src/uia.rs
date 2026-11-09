@@ -24,7 +24,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use windows::core::{Interface, BSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTONEAREST, RGN_OR};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, SAFEARRAY};
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData};
@@ -240,6 +240,38 @@ pub fn set_foreground(h: isize) -> bool {
     unsafe { SetForegroundWindow(hwnd_of(h)).as_bool() }
 }
 
+/// Give an overlay window the shape of `rects` (window-local physical pixels).
+/// Outside the shape nothing is drawn and the pointer reaches the window below,
+/// which is how the underline layer stays click-through on Windows: the usual
+/// WS_EX_LAYERED route hides a WebView2 window. Skips the call when unchanged.
+pub fn set_window_shape(h: isize, rects: &[(i32, i32, i32, i32)]) {
+    static LAST: Mutex<Option<HashMap<isize, Vec<(i32, i32, i32, i32)>>>> = Mutex::new(None);
+    if h == 0 {
+        return;
+    }
+    {
+        let mut g = LAST.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.get(&h).map(|v| v.as_slice() == rects).unwrap_or(false) {
+            return;
+        }
+        m.insert(h, rects.to_vec());
+    }
+    unsafe {
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        for &(x, y, w, hh) in rects {
+            if w <= 0 || hh <= 0 {
+                continue;
+            }
+            let r = CreateRectRgn(x, y, x + w, y + hh);
+            CombineRgn(Some(rgn), Some(rgn), Some(r), RGN_OR);
+            let _ = DeleteObject(r.into());
+        }
+        // The window owns the region from here on.
+        SetWindowRgn(hwnd_of(h), Some(rgn), true);
+    }
+}
+
 /// Pointer position in logical points.
 pub fn mouse_location() -> Option<(f64, f64)> {
     let mut p = POINT::default();
@@ -257,6 +289,9 @@ pub fn post_mouse_move(x: f64, y: f64) -> bool {
 /// Finds the focused text field of the app in front. Lives on the host thread.
 pub struct Watcher {
     auto: Option<IUIAutomation>,
+    /// The element found last tick: reused while focus stays on it, so its
+    /// patterns, unit probe and last text carry over between ticks.
+    last: std::cell::RefCell<Option<(Element, String)>>,
 }
 
 impl Watcher {
@@ -273,7 +308,7 @@ impl Watcher {
         if auto.is_none() {
             log::error!("UI Automation is not available");
         }
-        Watcher { auto }
+        Watcher { auto, last: std::cell::RefCell::new(None) }
     }
 
     /// The focused editable text element of another process, with its role.
@@ -309,6 +344,11 @@ impl Watcher {
                 _ => {}
             }
             let runtime_id: Vec<i32> = el.GetRuntimeId().map(|p| take_safearray::<i32>(p)).unwrap_or_default();
+            if let Some((cached, role)) = self.last.borrow().as_ref() {
+                if cached.0.pid == pid && !runtime_id.is_empty() && cached.0.runtime_id == runtime_id {
+                    return Some((cached.clone(), role.clone()));
+                }
+            }
             let native = el.CurrentNativeWindowHandle().map(|h| h.0 as isize).unwrap_or(0);
             let top = {
                 let fg = GetForegroundWindow();
@@ -322,7 +362,9 @@ impl Watcher {
             };
             let class = class_name(hwnd_of(native));
             let inner = Inner { el, tp, vp, pid, runtime_id, native, top, class, mode: AtomicU8::new(MODE_UNKNOWN), last_text: Mutex::new(String::new()) };
-            Some((Element(Arc::new(inner)), role.to_string()))
+            let found = (Element(Arc::new(inner)), role.to_string());
+            *self.last.borrow_mut() = Some(found.clone());
+            Some(found)
         }
     }
 }
