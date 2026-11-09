@@ -206,7 +206,7 @@ function Find-Window([string]$processName, [int]$Seconds = 20) {
 
 function Alert-By([string]$original) {
   $s = State
-  return @($s.alerts | Where-Object { $_.original -eq $original -and @($_.suggestions).Count -gt 0 }) | Select-Object -First 1
+  return @($s.alerts | Where-Object { $_.original -ceq $original -and @($_.suggestions).Count -gt 0 }) | Select-Object -First 1
 }
 
 # Share of pixels along a horizontal line of the screen that are clearly colored
@@ -397,7 +397,7 @@ try {
     $btn = Wait-Until { Find-CardButton "Dismiss" ($hov.geometry.origin_x) ($hov.geometry.origin_y) } 10
     if ($btn) {
       Click-Element $btn
-      $gone = Wait-Until { $t = State; if (-not @($t.alerts | Where-Object { $_.original -eq "Teh" })) { return $t } } 8
+      $gone = Wait-Until { $t = State; if (-not @($t.alerts | Where-Object { $_.original -ceq "Teh" })) { return $t } } 8
       $set = Probe "/settings"
       $txt = Get-EditorText $editor
       if ($gone -and $txt -like "*Teh end.*" -and (@($set.dismissed) | ForEach-Object { "$_" }) -contains "$($a.stable_hash)") { Pass "Dismiss on the card hides the alert and keeps the text" "'Teh' left as written; saved in settings" } else { Fail "card Dismiss" "gone=$([bool]$gone) text '$txt' dismissed=$(@($set.dismissed) -join ',')" }
@@ -494,8 +494,11 @@ try {
   $sk = Wait-Until { $s = State; if ($s.status.skipped) { return $s } } 10
   if ($sk) { Pass "terminal skipped" "front app $($sk.status.frontmost_bid), built in: $($sk.status.skip_built_in)" } else { $s = State; Fail "terminal skipped" "front=$($s.status.frontmost_bid) skipped=$($s.status.skipped)" }
   Shot "08-terminal-skipped"
+  # Close only our own terminal: type "exit" in it. Never stop Windows Terminal by
+  # name: on windows-2025 the runner's own shell runs in it, and the step dies.
+  if ($cw -and [W]::GetForegroundWindow() -eq $cw.MainWindowHandle) { [System.Windows.Forms.SendKeys]::SendWait("exit{ENTER}") }
+  Start-Sleep -Milliseconds 800
   Stop-Process -Id $cmd.Id -Force -ErrorAction SilentlyContinue
-  Get-Process WindowsTerminal -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
   # --- 8. Quit and uninstall ---------------------------------------------------------
   Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue

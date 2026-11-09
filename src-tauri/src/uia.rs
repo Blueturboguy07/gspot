@@ -222,7 +222,12 @@ pub fn frontmost_app() -> Option<(i32, String, String)> {
         if pid == 0 {
             return None;
         }
-        let (exe, name) = process_names(pid);
+        let (mut exe, name) = process_names(pid);
+        // A classic console window is a terminal whatever program runs in it
+        // (its window reports that program's process, not conhost.exe).
+        if class_name(hwnd) == "ConsoleWindowClass" {
+            exe = "conhost.exe".to_string();
+        }
         Some((pid as i32, exe, name))
     }
 }
