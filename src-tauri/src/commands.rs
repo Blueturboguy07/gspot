@@ -128,11 +128,11 @@ fn resolve_text(shared: &Shared, args: &Value) -> Result<(String, String, bool),
 }
 
 /// The model configuration a feature actually calls: for publik API the key
-/// and root come from the credential file (never from settings.json).
+/// and root come from the credential file the gate wrote (never from settings.json).
 pub fn effective_llm(settings: &Settings) -> Result<LlmConfig, String> {
     match settings.llm.provider {
         Provider::Publik => {
-            let cred = crate::publik::read_credential().ok_or("publik API is not set up on this computer yet. Open Settings → AI to turn it on, or paste your own key.")?;
+            let cred = crate::publik::credential().ok_or("This computer is not signed in to publik. Quit and open GSpot again to sign in, or paste your own key in Settings → AI.")?;
             Ok(LlmConfig { provider: Provider::Publik, base_url: cred.base_url.clone(), api_key: cred.key.clone(), model: if settings.llm.model.trim().is_empty() { cred.model.clone() } else { settings.llm.model.clone() } })
         }
         Provider::Ollama => Ok(settings.llm.clone()),
@@ -397,10 +397,13 @@ pub fn get_settings(state: State<'_, Shared>) -> Settings {
 pub fn set_settings(app: AppHandle, state: State<'_, Shared>, settings: Settings) -> Result<(), String> {
     {
         let mut st = state.lock().unwrap();
+        let before = st.settings.llm.provider.clone();
         st.settings = settings.clone();
         settings::save(&st.settings).map_err(err)?;
         // Re-apply the dismissed filter.
         st.alerts = st.visible_alerts();
+        // Settings → AI is the same answer the gate asked for: keep the two in step.
+        crate::publik::sync_choice(&before, &st.settings.llm.provider);
     }
     crate::overlay::dock_panel(&app, &settings.dock_side);
     let _ = app.emit("settings://changed", &settings);
@@ -505,25 +508,17 @@ pub fn publik_status_inner(shared: &Shared) -> Value {
     crate::publik::status(&st.settings)
 }
 
-/// The user tapped "Turn on publik API" on the disclosure: mint this
-/// computer's key, write the credential file, switch the model to publik and
-/// owe the first-run card.
+/// The user tapped "Turn on publik API" on the disclosure: select this computer's
+/// publik key (the gate signed it in at start) and remember the answer for the gate.
 pub async fn publik_accept_inner(app: &AppHandle, shared: &Shared) -> Result<Value, String> {
-    if let Some(existing) = crate::publik::read_credential() {
-        // Never overwrite a key we already hold: just select it.
-        save_settings(app, shared, |s| {
-            s.llm = LlmConfig { provider: Provider::Publik, base_url: existing.base_url.clone(), api_key: String::new(), model: existing.model.clone() };
-            s.publik.disclosure_version = crate::publik::DISCLOSURE_VERSION;
-        });
-        return Ok(publik_status_inner(shared));
-    }
-    let cred = crate::publik::provision(None).await.map_err(|e| e.message)?;
-    crate::publik::write_credential(&cred).map_err(|e| format!("The key was minted but could not be saved: {e}"))?;
+    let existing = crate::publik::credential().ok_or("This computer is not signed in to publik. Quit and open GSpot again to sign in.")?;
     save_settings(app, shared, |s| {
-        s.llm = LlmConfig { provider: Provider::Publik, base_url: cred.base_url.clone(), api_key: String::new(), model: cred.model.clone() };
+        s.llm = LlmConfig { provider: Provider::Publik, base_url: existing.base_url.clone(), api_key: String::new(), model: existing.model.clone() };
         s.publik.disclosure_version = crate::publik::DISCLOSURE_VERSION;
-        s.publik.first_run_owed = true;
+        s.publik.first_run_owed = false;
     });
+    crate::publik::set_choice(Some("publik"));
+    let _ = tauri::async_runtime::spawn_blocking(crate::publik::refresh_wallet).await;
     Ok(publik_status_inner(shared))
 }
 
@@ -532,23 +527,19 @@ pub fn publik_dismiss_first_run_inner(app: &AppHandle, shared: &Shared) -> Value
     publik_status_inner(shared)
 }
 
-/// Forget this computer's key. The model setting returns to the publik default,
-/// which then reports itself as not set up.
+/// Forget this computer's key: the sign-in goes, the model setting moves to an own
+/// key, and the next start shows Sign in with publik again.
 pub fn publik_forget_inner(app: &AppHandle, shared: &Shared) -> Value {
     crate::publik::forget_credential();
     save_settings(app, shared, |s| {
         s.publik.first_run_owed = false;
-        if s.llm.provider == Provider::Publik {
-            s.llm = LlmConfig::default();
-        }
+        crate::publik::apply_choice(s, Some("own_key"));
     });
     publik_status_inner(shared)
 }
 
 pub async fn publik_refresh_inner(shared: &Shared) -> Result<Value, String> {
-    if let Some(cred) = crate::publik::read_credential() {
-        let _ = crate::publik::wallet(&cred).await;
-    }
+    let _ = tauri::async_runtime::spawn_blocking(crate::publik::refresh_wallet).await;
     Ok(publik_status_inner(shared))
 }
 

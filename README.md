@@ -27,8 +27,11 @@ tucks into the left. `dock_side` in Settings flips it.)
   edit control's own select-and-replace messages (Notepad, WordPad, other Win32 edit and rich-edit
   fields), then a UI Automation selection plus a verified Ctrl+V paste (browsers, Office), then the
   field's UI Automation value for plain fields.
-* AI features: **publik API** by default (no account, no key: the app mints its own key on this
-  computer after a two-sentence disclosure; you sign in with publik to add free use or a plan),
+* Sign in with publik: GSpot opens with a sign-in window. A signed-in person then picks publik API
+  ("Get a plan" or "Connect your plan") or their own key ("Use my own key"). The answer is kept, and
+  Settings → AI changes it later.
+* AI features: **publik API** (this computer's publik key, minted at sign-in; a plan or a balance on
+  your publik account pays per use at a published price),
   or your own key (paste it; OpenAI, Anthropic, OpenRouter, Groq and Google are detected from the
   prefix and a model is picked for you). URLs, ports and model names sit under "Advanced". There
   is no local-model option; only the e2e rig points the app at Ollama, through the debug probe.
@@ -62,15 +65,15 @@ GSpot is listed on [publik](https://publikhq.com/gspot).
    (It cannot read apps that run as administrator unless GSpot does too.)
 
 GSpot lives in the menu bar (macOS) or the notification area (Windows), and as a tab on the left
-screen edge. AI features run through publik API by default; the first use shows a two-sentence
-disclosure and mints a key for this computer.
+screen edge. The first start shows "Sign in with publik". After sign-in you choose publik API or
+your own key.
 
 ## Usage counts
 
 GSpot sends two usage events to publik: `app_opened` at start, and `active_session` every 30 minutes
 while it runs. An event holds the app name, the app version, the operating system, the CPU type and a
-random install ID. When publik API is on, the publik key of this computer goes with it. No text, no
-file name and no personal data is sent. To turn it off, set `DO_NOT_TRACK=1` in the environment, or put
+random install ID and this computer's publik key (from the sign-in), so a signed-in person is counted
+once. No text, no file name and no personal data is sent. To turn it off, set `DO_NOT_TRACK=1` in the environment, or put
 `{"usage": false}` in `~/Library/Application Support/publik/consent.json` (Windows:
 `%LOCALAPPDATA%\publik\consent.json`).
 Details: https://publikhq.com/skills/telemetry.md
@@ -93,9 +96,9 @@ tests there, and then runs `tests/e2e/windows/e2e.ps1` on clean Windows Server 2
 
 Grant Accessibility to GSpot once (System Settings → Privacy & Security → Accessibility).
 The publik app token is read from `PUBLIK_APP_TOKEN` or `~/.publik/gspot-app-token` at build
-time (minted with publik's `scripts/mint-app-token.mts gspot`); a build without it still
-offers your own key. `PUBLIK_SELF_TEST=1 /Applications/GSpot.app/Contents/MacOS/grammarlama` prints one
-line that proves the publik API wiring of a built app.
+time (minted with publik's `scripts/mint-app-token.mts gspot`); a build without it cannot sign in
+a new computer, and the sign-in window says so. `PUBLIK_SELF_TEST=1 /Applications/GSpot.app/Contents/MacOS/grammarlama`
+prints one line that proves the publik API wiring of a built app.
 
 ## Test
 
