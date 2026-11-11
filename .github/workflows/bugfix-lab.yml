@@ -1,5 +1,8 @@
 name: bugfix-lab
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    branches: ['fix/**']
 permissions:
   contents: read
 env:
