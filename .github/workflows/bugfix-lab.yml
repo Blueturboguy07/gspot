@@ -1,0 +1,38 @@
+name: bugfix-lab
+on: workflow_dispatch
+permissions:
+  contents: read
+env:
+  DO_NOT_TRACK: '1'
+jobs:
+  lab:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g pnpm@12.8.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+      - run: pnpm --dir ui install --frozen-lockfile
+      - run: pnpm --dir ui run build
+      - name: Build the app binary
+        working-directory: src-tauri
+        run: cargo build --release --locked
+      - name: Reproduce
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File scripts/bugfix-lab/gspot-20261109-7e515a.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lab-out
+          path: lab-out/
