@@ -1,53 +1,433 @@
-//! publik API: the zero-setup AI option. Provisioning (`POST /installs` with
-//! the app token baked into this build), the per-app credential file, the
-//! wallet, and the live status the panel renders (balance line, the one
-//! justification sentence, the plan button, a 402 notice with exactly one link).
+//! publik: Sign in with publik, usage counting, and publik API as one provider option.
 //!
-//! Contract: ~/publik-api-research/CONTRACT.md §1, §3.2, §12, §13 and
-//! docs/publik-sdk-convention.md §6. Copy rule: "publik API", dollars, never
-//! tokens, never "credits" as a unit, never the provider's name.
+//! The first part of this file is the publik module from
+//! https://publikhq.com/sdk/publik.rs.md. GSpot changes four lines of it:
+//! 1. `APP_TOKEN` is compiled in from `PUBLIK_APP_TOKEN` at build time (scripts/build-macos.sh,
+//!    the CI secret), as every GSpot build before it. There is no token file in the repo.
+//! 2. `APP_VERSION` is the Cargo package version.
+//! 3. `curl` runs without a console window on Windows.
+//! 4. The origin is https://publikhq.com.
+//!
+//! The second part ("GSpot") is what the app adds on top: the status card the AI panel
+//! renders, the 402 mapping llm.rs uses, the plagiarism search, and the link between the
+//! gate's choice and Settings → AI. The gate window itself is publik_gate.rs.
 
-use serde::{Deserialize, Serialize};
+// publik.rs — Sign in with publik, usage counting, and publik API as one provider option.
+// At app start, before any window of your own: `let gate = publik::ensure_signed_in(&mut ui);`. It
+//   1. loads or provisions this computer's publik key (POST /api/v1/installs);
+//   2. shows Sign in with publik until GET /api/v1/wallet says "claimed" (no other way past it);
+//   3. when USES_AI: asks once how the app pays for AI and stores the answer (set_choice() changes it);
+//   4. starts usage counting: app_opened now, active_session every 30 minutes (POST /api/v1/telemetry).
 use serde_json::{json, Value};
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub const APP_SLUG: &str = "gspot";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// false: the app calls no model. It still signs in and counts users; it skips the plan screen.
+pub const USES_AI: bool = true;
+/// Ask for a tier, never a vendor model name.
+pub const MODELS: [&str; 3] = ["publik-fast", "publik-balanced", "publik-smart"];
+// Public by design: it can only mint capped keys attributed to this app. GSpot compiles it in
+// from PUBLIK_APP_TOKEN at build time (scripts/build-macos.sh, the CI secret). A build without
+// it has no publik option: the gate says so, and your own key keeps working.
+const APP_TOKEN: &str = match option_env!("PUBLIK_APP_TOKEN") {
+    Some(t) => t,
+    None => "",
+};
+const OS: &str = if cfg!(target_os = "macos") { "macos" } else if cfg!(windows) { "windows" } else { "linux" };
+
+fn origin() -> String { std::env::var("PUBLIK_ORIGIN").unwrap_or_else(|_| "https://publikhq.com".into()) } // PUBLIK_ORIGIN: tests only
+pub fn default_base_url() -> String { format!("{}/api/v1", origin()) }
+
+pub enum Provider { Own { base_url: String, api_key: String }, Publik { base_url: String, api_key: String }, NeedsOwnKey }
+pub struct Screen { pub id: &'static str, pub title: &'static str, pub body: String, pub note: Option<&'static str>, pub buttons: Vec<(&'static str, &'static str)> }
+/// show(): draw the screen and return the button id pressed. Once `done` is set (the gate saw the sign-in), close it and return None.
+pub trait GateUi { fn show(&mut self, screen: &Screen, done: Arc<AtomicBool>) -> Option<&'static str>; fn open_url(&mut self, url: &str); }
+
+/// ~/Library/Application Support/publik, %LOCALAPPDATA%\publik, ~/.config/publik: shared by every publik app.
+fn publik_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
+    let base = if cfg!(target_os = "macos") { home.join("Library/Application Support") }
+        else if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or(home.join("AppData/Local")) }
+        else { std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or(home.join(".config")) };
+    base.join("publik")
+}
+pub fn credential_path() -> PathBuf { publik_dir().join("apps").join(format!("{APP_SLUG}.json")) }
+
+pub fn read_credential() -> Option<Value> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(credential_path()).ok()?).ok()?;
+    v["key"].as_str().filter(|k| k.starts_with("pk_"))?;
+    Some(v)
+}
+fn write_credential(v: &Value) -> Result<(), String> {
+    let path = credential_path();
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, serde_json::to_string_pretty(v).unwrap()).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)); }
+    Ok(())
+}
+/// The person's answer to the plan screen: Some("publik"), Some("own_key"), or None to ask again. Settings call it.
+pub fn set_choice(choice: Option<&str>) { if let Some(mut c) = read_credential() { c["choice"] = json!(choice); let _ = write_credential(&c); } }
+
+/// The key this app uses: the stored choice decides. PUBLIK_API_KEY / PUBLIK_API_BASE_URL override (development).
+pub fn resolve_provider(user_key: Option<(String, String)>) -> Provider {
+    if let Ok(key) = std::env::var("PUBLIK_API_KEY") {
+        return Provider::Publik { base_url: std::env::var("PUBLIK_API_BASE_URL").unwrap_or_else(|_| default_base_url()), api_key: key };
+    }
+    if let Some(c) = read_credential().filter(|c| c["choice"] == "publik") {
+        return Provider::Publik { base_url: c["base_url"].as_str().map(String::from).unwrap_or_else(default_base_url), api_key: c["key"].as_str().unwrap_or_default().into() };
+    }
+    match user_key.filter(|(_, k)| !k.is_empty()) { Some((base_url, api_key)) => Provider::Own { base_url, api_key }, None => Provider::NeedsOwnKey }
+}
+
+/// One curl call; `stdin` carries the body or a config with the key. Err: publik is not reachable.
+fn curl(args: &[&str], stdin: &str) -> Result<(u16, Value), String> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "-w", "\n%{http_code}"]).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); } // CREATE_NO_WINDOW: no console flashes up
+    let mut child = cmd.spawn().map_err(|e| format!("curl: {e}"))?;
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).map_err(|e| e.to_string())?;
+    let out = String::from_utf8_lossy(&child.wait_with_output().map_err(|e| e.to_string())?.stdout).to_string();
+    let (payload, code) = out.rsplit_once('\n').unwrap_or(("", &out));
+    match code.trim().parse::<u16>().unwrap_or(0) {
+        0 => Err("publik is not reachable. Check your connection.".into()),
+        code => Ok((code, serde_json::from_str(payload).unwrap_or(json!({})))),
+    }
+}
+fn key_config(key: &str) -> String { format!("header = \"Authorization: Bearer {key}\"\n") }
+
+/// POST /api/v1/installs: this computer's publik key. Err is a readable message.
+pub fn provision() -> Result<Value, String> {
+    let runtime = std::env::var("PUBLIK_APP_TOKEN").unwrap_or_default();
+    let token = if runtime.trim().is_empty() { APP_TOKEN.trim() } else { runtime.trim() };
+    if !token.starts_with("pat_") { return Err("This build has no publik app token. Ask the developer for a new build.".into()); }
+    let mut prior = read_credential().unwrap_or(json!({}));
+    let mut install_id = prior["install_id"].as_str().map(String::from).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    for _ in 0..2 {
+        let body = json!({ "app_token": token, "app_slug": APP_SLUG, "app_version": APP_VERSION, "os": OS, "arch": std::env::consts::ARCH,
+            "install_id": install_id, "disclosure_version": 1, "dialects": ["chat_completions"] });
+        let url = format!("{}/api/v1/installs", origin());
+        let (code, res) = curl(&["-m", "20", "-X", "POST", &url, "-H", "content-type: application/json", "--data-binary", "@-"], &body.to_string())?;
+        let key = res["key"].as_str().or(if code == 200 { prior["key"].as_str() } else { None }).map(String::from);
+        if let (200 | 201, Some(key)) = (code, key) {
+            let c = json!({ "key": key, "base_url": res["base_url"].as_str().map(String::from).unwrap_or_else(default_base_url),
+                "install_id": res["install_id"].as_str().unwrap_or(&install_id), "claim_url": res["claim_url"], "choice": prior["choice"] });
+            write_credential(&c)?; // the key reaches disk before anything else sees it
+            return Ok(c);
+        }
+        if code == 200 || res["error"]["type"] == "install_revoked" { install_id = uuid::Uuid::new_v4().to_string(); prior = json!({}); continue; }
+        return Err(res["error"]["message"].as_str().map(String::from).unwrap_or_else(|| format!("publik could not set up this computer ({code}).")));
+    }
+    Err("publik could not set up this computer.".into())
+}
+
+/// GET /api/v1/wallet: (status, wallet or None, message). Err: publik is not reachable.
+pub fn read_wallet(key: &str) -> Result<(u16, Option<Value>, Option<String>), String> {
+    let url = format!("{}/api/v1/wallet", origin());
+    let (code, mut b) = curl(&["-m", "15", "-K", "-", &url], &key_config(key))?;
+    if code != 200 || !b["claim_state"].is_string() { return Ok((code, None, b["error"]["message"].as_str().map(String::from))); }
+    if !b["plan"].is_object() { b["plan"] = json!({ "kind": "none", "label": null }); }
+    Ok((code, Some(b), None))
+}
+
+/// The words of the gate. The same in every publik module.
+pub fn gate_screen(id: &'static str, w: Option<&Value>, note: Option<&'static str>, message: Option<String>) -> Screen {
+    if id == "unreachable" {
+        return Screen { id, title: "Sign in with publik", body: message.unwrap_or_else(|| "publik is not reachable. Check your connection.".into()), note, buttons: vec![("retry", "Retry")] };
+    }
+    if id == "sign_in" {
+        return Screen { id, title: "Sign in with publik", note, buttons: vec![("sign_in", "Sign in with publik")],
+            body: "This app uses your publik account. Click Sign in with publik, then sign in in your browser. This window continues when you are signed in.".into() };
+    }
+    let w = w.cloned().unwrap_or(json!({ "plan": { "kind": "none" } }));
+    let who = match w["account"]["handle"].as_str() { Some(h) => format!("You are signed in as @{h}."), None => "You are signed in to publik.".into() };
+    if !has_plan(&w) {
+        return Screen { id, title: "Choose how to pay for AI", note, body: format!("{who} This app uses AI. Get a publik plan, or use your own key."),
+            buttons: vec![("get_plan", "Get a plan"), ("own_key", "Use my own key")] };
+    }
+    let what = if w["plan"]["kind"] == "plan" { format!("Your plan: {}.", w["plan"]["label"].as_str().unwrap_or("publik")) }
+        else { format!("Your balance: ${:.2}.", w["balance_micros"].as_i64().unwrap_or(0) as f64 / 1_000_000.0) };
+    Screen { id, title: "Connect your plan", note, body: format!("{who} {what} Connect it to use AI in this app, or use your own key."),
+        buttons: vec![("connect", "Connect your plan"), ("own_key", "Use my own key")] }
+}
+fn claimed(w: &Value) -> bool { w["claim_state"] == "claimed" }
+fn has_plan(w: &Value) -> bool { w["plan"]["kind"].as_str().unwrap_or("none") != "none" || w["balance_micros"].as_i64().unwrap_or(0) > 0 }
+
+/// Show a screen; with `until`, poll GET /wallet every 3 s for at most 10 minutes. "done": the poll saw it; "timeout": it did not.
+fn ask(ui: &mut dyn GateUi, screen: &Screen, key: &str, until: Option<fn(&Value) -> bool>) -> &'static str {
+    let done = Arc::new(AtomicBool::new(false));
+    let polled: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+    if let Some(until) = until {
+        let (done, polled, key) = (done.clone(), polled.clone(), key.to_string());
+        std::thread::spawn(move || {
+            let mut result = "timeout";
+            'poll: for _ in 0..200 { // 200 x 3 s = 10 minutes
+                for _ in 0..30 { std::thread::sleep(Duration::from_millis(100)); if done.load(Ordering::SeqCst) { return; } }
+                if let Ok((_, Some(w), _)) = read_wallet(&key) { if until(&w) { result = "done"; break 'poll; } }
+            }
+            *polled.lock().unwrap() = Some(result);
+            done.store(true, Ordering::SeqCst);
+        });
+    }
+    let action = ui.show(screen, done.clone());
+    done.store(true, Ordering::SeqCst);
+    let polled = *polled.lock().unwrap();
+    action.or(polled).unwrap_or("retry")
+}
+
+/// The gate (see the top of the file). Returns (key, wallet, choice) once the person is signed in; choice is None when USES_AI is false.
+pub fn ensure_signed_in(ui: &mut dyn GateUi) -> (String, Value, Option<String>) {
+    if std::env::var_os("PUBLIK_SELF_TEST").is_some() { println!("{}", self_test()); std::process::exit(0); }
+    let (mut sign_note, mut sign_poll, mut plan_note, mut plan_poll): (Option<&'static str>, bool, Option<&'static str>, bool) = (None, true, None, false);
+    loop {
+        let env_key = std::env::var("PUBLIK_API_KEY").ok().filter(|k| !k.is_empty());
+        let c = match env_key.clone().map(|k| Ok(json!({ "key": k }))).or_else(|| read_credential().map(Ok)).unwrap_or_else(provision) {
+            Ok(c) => c,
+            Err(e) => { ask(ui, &gate_screen("unreachable", None, None, Some(e)), "", None); continue; }
+        };
+        let key = c["key"].as_str().unwrap_or_default().to_string();
+        let w = match read_wallet(&key) {
+            Err(_) => { ask(ui, &gate_screen("unreachable", None, None, None), "", None); continue; }
+            Ok((401, _, _)) if env_key.is_none() => { let _ = write_credential(&json!({})); continue; } // a revoked key: provision again
+            Ok((_, None, message)) => { ask(ui, &gate_screen("unreachable", None, None, message), "", None); continue; }
+            Ok((_, Some(w), _)) => w,
+        };
+        if !claimed(&w) {
+            let a = ask(ui, &gate_screen("sign_in", Some(&w), sign_note, None), &key, if sign_poll { Some(claimed) } else { None });
+            if a == "sign_in" {
+                ui.open_url(w["claim_url"].as_str().or(c["claim_url"].as_str()).unwrap_or(&format!("{}/wallet", origin())));
+                (sign_note, sign_poll) = (Some("Waiting for you to sign in in your browser."), true);
+            }
+            if a == "timeout" { (sign_note, sign_poll) = (Some("No sign-in after 10 minutes. Click Sign in with publik to try again."), false); }
+            continue;
+        }
+        let mut choice = if USES_AI { read_credential().and_then(|c| c["choice"].as_str().map(String::from)) } else { None };
+        if USES_AI && choice.is_none() {
+            if has_plan(&w) { (plan_note, plan_poll) = (None, false); } // the plan is there: Connect your plan
+            let a = ask(ui, &gate_screen("choose", Some(&w), plan_note, None), &key, if plan_poll { Some(has_plan) } else { None });
+            (plan_note, plan_poll) = (None, false);
+            if a == "get_plan" {
+                ui.open_url(w["top_up_url"].as_str().unwrap_or(&format!("{}/wallet", origin())));
+                (plan_note, plan_poll) = (Some("Waiting for your plan. Finish in your browser."), true);
+            }
+            if a == "timeout" { plan_note = Some("No plan after 10 minutes. Click Get a plan to try again."); }
+            if a != "connect" && a != "own_key" { continue; } // "done": the plan is there; the next screen is Connect your plan
+            choice = Some(if a == "connect" { "publik" } else { "own_key" }.to_string());
+            set_choice(choice.as_deref());
+        }
+        start_telemetry();
+        return (key, w, choice);
+    }
+}
+
+/// Builder check, run by the BUILT app: PUBLIK_SELF_TEST=1 makes ensure_signed_in() print this line and exit.
+pub fn self_test() -> String {
+    let result = provision().and_then(|c| read_wallet(c["key"].as_str().unwrap_or_default())).and_then(|(code, w, message)| match w {
+        Some(_) => Ok(()),
+        None => Err(message.unwrap_or_else(|| format!("GET /wallet answered {code}"))),
+    });
+    match result { Ok(()) => format!("publik self-test: ok {APP_SLUG} {APP_VERSION}"), Err(e) => format!("publik self-test: failed: {e}") }
+}
+
+/// A terminal UI for a command-line app. A desktop app passes its own GateUi (see the page).
+pub struct TerminalUi;
+impl GateUi for TerminalUi {
+    fn show(&mut self, s: &Screen, done: Arc<AtomicBool>) -> Option<&'static str> {
+        println!("\n{}\n{}{}", s.title, s.body, s.note.map(|n| format!("\n{n}")).unwrap_or_default());
+        for (i, (_, label)) in s.buttons.iter().enumerate() { println!("  {}. {label}", i + 1); }
+        let answered = Arc::new(AtomicBool::new(false));
+        let (d, a) = (done.clone(), answered.clone());
+        std::thread::spawn(move || { while !d.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(200)); } if !a.load(Ordering::SeqCst) { println!("\nDone. Press Enter to continue."); } });
+        loop {
+            print!("{}", if s.buttons.len() > 1 { "Type a number and press Enter: " } else { "Press Enter: " });
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if std::io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 { while !done.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(200)); } return None; }
+            if done.load(Ordering::SeqCst) { return None; }
+            let n: usize = line.trim().parse().unwrap_or(1);
+            if let Some((action, _)) = s.buttons.get(n.wrapping_sub(1)) { answered.store(true, Ordering::SeqCst); return Some(action); }
+        }
+    }
+    fn open_url(&mut self, url: &str) {
+        println!("Open this link if your browser does not open: {url}");
+        let _ = if cfg!(target_os = "macos") { Command::new("open").arg(url).spawn() }
+            else if cfg!(windows) { Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn() }
+            else { Command::new("xdg-open").arg(url).spawn() };
+    }
+}
+
+// ---------- usage counting: /skills/telemetry.md sections 3-5 ----------
+static TELEMETRY_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn usage_off() -> bool {
+    let env = |n: &str| std::env::var(n).unwrap_or_default().trim().to_lowercase();
+    if !["", "0", "false"].contains(&env("DO_NOT_TRACK").as_str()) || ["0", "false", "off"].contains(&env("PUBLIK_TELEMETRY").as_str()) { return true; }
+    std::fs::read_to_string(publik_dir().join("consent.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).map(|v| v["usage"] == false).unwrap_or(false)
+}
+fn is_uuid_v4(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36 && b.iter().enumerate().all(|(i, c)| if [8, 13, 18, 23].contains(&i) { *c == b'-' } else { c.is_ascii_hexdigit() })
+        && b[14] == b'4' && b"89abAB".contains(&b[19])
+}
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = ((secs / 86_400) as i64 + 719_468, secs % 86_400); // days since 0000-03-01
+    let (era, doe) = (days / 146_097, days % 146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (day, month) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yoe + era * 400 + i64::from(month <= 2), month, day, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+/// One random UUID per computer account, shared by every publik app, in <publik dir>/telemetry.json (mode 0600).
+fn telemetry_install_id() -> String {
+    let file = publik_dir().join("telemetry.json");
+    let saved = || std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v["install_id"].as_str().map(str::to_lowercase)).filter(|id| is_uuid_v4(id));
+    if let Some(id) = saved() { return id; }
+    let fresh = uuid::Uuid::new_v4().to_string(); // if the file cannot be saved, this ID lasts for this run only
+    let _ = std::fs::create_dir_all(publik_dir());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true); // never over another app's file
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    match options.open(&file) {
+        Ok(mut f) => { let _ = writeln!(f, "{}", json!({ "install_id": fresh, "created_at": utc_now() })); fresh }
+        Err(_) => saved().unwrap_or(fresh), // another publik app saved its ID first
+    }
+}
+fn send_event(event: &str, install_id: &str) {
+    let say = |result: &str| if std::env::var("PUBLIK_TELEMETRY_DEBUG").as_deref() == Ok("1") { eprintln!("publik-telemetry: {event} -> {result}"); };
+    if usage_off() { return say("off (opt-out)"); }
+    let key = std::env::var("PUBLIK_API_KEY").ok().or_else(|| read_credential().and_then(|c| c["key"].as_str().map(String::from))).filter(|k| k.starts_with("pk_"));
+    let mut body = json!({ "v": 1, "app": APP_SLUG, "install_id": install_id, "event": event, "app_version": APP_VERSION.trim_start_matches(['v', 'V']), "os": OS });
+    match std::env::consts::ARCH { "aarch64" => body["arch"] = json!("arm64"), "x86_64" => body["arch"] = json!("x64"), _ => {} }
+    let url = std::env::var("PUBLIK_TELEMETRY_URL").unwrap_or_else(|_| format!("{}/api/v1/telemetry", origin()));
+    let body = body.to_string();
+    let args = ["-m", "5", "-K", "-", "-X", "POST", url.as_str(), "-H", "content-type: application/json", "--data-raw", body.as_str()];
+    match curl(&args, &key.map(|k| key_config(&k)).unwrap_or_default()) { Ok((code, _)) => say(&code.to_string()), Err(e) => say(&e) }
+}
+/// Called by ensure_signed_in(). app_opened now, active_session every 30 minutes, on a background thread; never panics the app.
+pub fn start_telemetry() {
+    if TELEMETRY_STARTED.swap(true, Ordering::SeqCst) { return; }
+    let s: u64 = std::env::var("PUBLIK_TELEMETRY_INTERVAL_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0); // tests only
+    let interval = Duration::from_secs(if (1..=86_400).contains(&s) { s } else { 1_800 });
+    std::thread::spawn(move || {
+        let id = telemetry_install_id();
+        send_event("app_opened", &id);
+        loop { std::thread::sleep(interval); send_event("active_session", &id); }
+    });
+}
+
+// ---------- publik API calls ----------
+/// A 402 renders its message plus exactly ONE link: this one.
+pub fn top_up_url_from_402(body: &Value) -> (String, Option<String>) {
+    let e = &body["error"];
+    (e["message"].as_str().unwrap_or("Not enough publik API balance.").into(), e["top_up_url"].as_str().map(String::from))
+}
+
+/// `POST /search`: web results for `q` (quote a phrase to find it exactly), one published price per search; Err = (message, top_up_url) from a 402 or a readable failure.
+pub fn search_results(base_url: &str, api_key: &str, q: &str, count: u8) -> Result<Vec<Value>, (String, Option<String>)> {
+    let (url, body) = (format!("{base_url}/search"), json!({ "q": q, "count": count }).to_string());
+    match curl(&["-m", "30", "-K", "-", "-X", "POST", &url, "-H", "content-type: application/json", "--data-raw", &body], &key_config(api_key)) {
+        Ok((200, v)) => Ok(v["results"].as_array().cloned().unwrap_or_default()),
+        Ok((402, v)) => Err(top_up_url_from_402(&v)),
+        Ok((c, _)) => Err((format!("publik API answered {c}."), None)),
+        Err(e) => Err((e, None)),
+    }
+}
+
+// ============================================================================ GSpot
+// What GSpot adds to the module: the status card the AI panel renders, the 402 mapping
+// llm.rs uses, the plagiarism search, and the link between the gate's choice and
+// Settings → AI. Copy rule: "publik API", dollars, never tokens, never the provider's name.
+
+use serde::Serialize;
 
 pub const DEFAULT_BASE_URL: &str = "https://publikhq.com/api/v1";
 pub const DASHBOARD_URL: &str = "https://publikhq.com/dashboard/api";
 pub const TERMS_URL: &str = "https://publikhq.com/terms#api";
-pub const APP_SLUG: &str = "gspot";
 pub const DISCLOSURE_VERSION: u32 = 1;
-/// The alias the gateway maps to its balanced tier: the writing quality the
-/// sidebar features need. Anonymous keys cannot use `publik-smart`.
+/// The tier the sidebar features use: the writing quality they need. A tier, never a vendor model name.
 pub const DEFAULT_MODEL: &str = "publik-balanced";
-/// Baked in by scripts/build-macos.sh (or `PUBLIK_APP_TOKEN` at `cargo build`).
-/// A build without it has no publik option; your own key keeps working.
-const APP_TOKEN: Option<&str> = option_env!("PUBLIK_APP_TOKEN");
 /// The only host a claim / top-up link may point at. Anything else is dropped.
 const LINK_HOST_PREFIX: &str = "https://publikhq.com/";
 
-/// The one-sentence justification (CONTRACT §13 wording), shown wherever money is mentioned.
+/// The one-sentence justification, shown wherever money is mentioned.
 pub const WHY_IT_COSTS: &str = "The model's provider charges per use. publik charges a fixed, published price that sits above what the model costs publik; the difference keeps publik running and pays the developer who built this app. Nothing is charged behind your back, and every call is visible on your publik dashboard.";
-/// The consent sheet's cost sentence (never promises a starter).
-pub const DISCLOSURE_COST: &str = "A new computer starts at $0.00. Linking this computer to your publik account gives $0.05 of free use, once. After that every request is priced per use at a fixed, published price from your publik balance, and every charge is visible on your dashboard.";
-pub const DISCLOSURE_DATA: &str = "The text you check goes through publik's servers to a shared model account. publik never trains on it and does not store it. Spelling and grammar checks stay on this Mac.";
+/// The AI picker's cost sentence.
+pub const DISCLOSURE_COST: &str = "Every request is priced per use at a fixed, published price from your publik plan or balance, and every charge is visible on your dashboard.";
+pub const DISCLOSURE_DATA: &str = "The text you check goes through publik's servers to a shared model account. publik never trains on it and does not store it. Spelling and grammar checks stay on this computer.";
 pub const CTA_SIGN_IN: &str = "Sign in with publik";
 pub const CTA_ADD_PLAN: &str = "Add a plan or pack";
 pub const CTA_LATER: &str = "Later";
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+/// This computer's publik key, as llm.rs and the plagiarism search use it.
+#[derive(Clone, Debug, Default)]
 pub struct Credential {
     pub key: String,
     pub base_url: String,
     pub install_id: String,
-    pub app_slug: String,
-    pub model: String,
     pub claim_url: String,
-    pub add_credit_url: String,
-    pub claim_state: String,
-    pub minted_at: String,
+    pub model: String,
+}
+
+/// The key in force: `PUBLIK_API_KEY` in the environment (development), else the credential file the gate wrote.
+pub fn credential() -> Option<Credential> {
+    if let Ok(k) = std::env::var("PUBLIK_API_KEY") {
+        let k = k.trim().to_string();
+        if k.starts_with("pk_") {
+            return Some(Credential { key: k, base_url: resolve_base_url(""), model: DEFAULT_MODEL.into(), ..Default::default() });
+        }
+    }
+    let c = read_credential()?;
+    Some(Credential {
+        key: c["key"].as_str().unwrap_or_default().to_string(),
+        base_url: resolve_base_url(c["base_url"].as_str().unwrap_or_default()),
+        install_id: c["install_id"].as_str().unwrap_or_default().to_string(),
+        claim_url: publik_link(c["claim_url"].as_str()).unwrap_or_default(),
+        model: DEFAULT_MODEL.into(),
+    })
+}
+
+/// Forget this computer's key. The next start signs in again.
+pub fn forget_credential() {
+    let _ = std::fs::remove_file(credential_path());
+    *WALLET.lock().unwrap() = None;
+    clear_live();
+}
+
+pub fn publik_link(s: Option<&str>) -> Option<String> {
+    let s = s?.trim();
+    if s.starts_with(LINK_HOST_PREFIX) {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+fn trim_url(s: &str) -> Option<String> {
+    let t = s.trim().trim_end_matches('/');
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// `PUBLIK_API_BASE_URL` (dev) → the credential's `base_url` → the default.
+pub fn resolve_base_url(from_credential: &str) -> String {
+    if let Some(u) = std::env::var("PUBLIK_API_BASE_URL").ok().and_then(|s| trim_url(&s)) {
+        return u;
+    }
+    trim_url(from_credential).unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 /// A typed gateway failure: what to show, and the one link to render.
@@ -93,6 +473,8 @@ pub struct Notice {
 }
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+/// The wallet the gate read at start-up (and every refresh since): the card's plan, balance and links.
+static WALLET: Mutex<Option<Value>> = Mutex::new(None);
 
 fn live() -> Live {
     LIVE.lock().unwrap().clone().unwrap_or_default()
@@ -110,189 +492,6 @@ pub fn dismiss_notice() {
     with_live(|l| l.notice = None);
 }
 
-pub fn can_provision() -> bool {
-    APP_TOKEN.map(|t| !t.trim().is_empty()).unwrap_or(false)
-}
-
-pub fn publik_link(s: Option<&str>) -> Option<String> {
-    let s = s?.trim();
-    if s.starts_with(LINK_HOST_PREFIX) {
-        Some(s.to_string())
-    } else {
-        None
-    }
-}
-
-fn trim_url(s: &str) -> Option<String> {
-    let t = s.trim().trim_end_matches('/');
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
-    }
-}
-
-/// `PUBLIK_API_BASE_URL` (dev) → the provisioning response's `base_url` → the default.
-pub fn resolve_base_url(from_credential: &str) -> String {
-    if let Some(u) = std::env::var("PUBLIK_API_BASE_URL").ok().and_then(|s| trim_url(&s)) {
-        return u;
-    }
-    trim_url(from_credential).unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
-}
-
-/// The folder all publik apps share on this computer account:
-/// `~/Library/Application Support/publik` on macOS, `%LOCALAPPDATA%\publik` on Windows.
-fn publik_root() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).filter(|p| p.is_absolute());
-        let local = local.or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("AppData").join("Local")))?;
-        Some(local.join("publik"))
-    }
-    #[cfg(not(windows))]
-    {
-        let home = std::env::var("HOME").ok()?;
-        Some(PathBuf::from(home).join("Library/Application Support/publik"))
-    }
-}
-
-/// `<publik folder>/apps/gspot.json` (the convention file Iris and the other publik apps share).
-pub fn credential_path() -> Option<PathBuf> {
-    Some(publik_root()?.join("apps").join(format!("{APP_SLUG}.json")))
-}
-
-/// Credential file written by builds that shipped under the old slug `grammarlama`.
-fn legacy_credential_path() -> Option<PathBuf> {
-    Some(publik_root()?.join("apps").join("grammarlama.json"))
-}
-
-/// The key in force: `PUBLIK_API_KEY` in the environment, else the credential file.
-pub fn read_credential() -> Option<Credential> {
-    if let Ok(k) = std::env::var("PUBLIK_API_KEY") {
-        let k = k.trim().to_string();
-        if k.starts_with("pk_") {
-            return Some(Credential { key: k, base_url: resolve_base_url(""), model: DEFAULT_MODEL.into(), app_slug: APP_SLUG.into(), ..Default::default() });
-        }
-    }
-    let path = credential_path()?;
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        // A computer set up by a build that shipped under the old slug: adopt its
-        // credential once (same key, same install) and keep it at the new path.
-        Err(_) => {
-            let r = std::fs::read_to_string(legacy_credential_path()?).ok()?;
-            if let Ok(mut c) = serde_json::from_str::<Credential>(&r) {
-                c.app_slug = APP_SLUG.into();
-                let _ = write_credential(&c);
-            }
-            r
-        }
-    };
-    let mut c: Credential = serde_json::from_str(&raw).ok()?;
-    if !c.key.starts_with("pk_") {
-        return None;
-    }
-    c.app_slug = APP_SLUG.into();
-    c.base_url = resolve_base_url(&c.base_url);
-    if c.model.trim().is_empty() {
-        c.model = DEFAULT_MODEL.into();
-    }
-    Some(c)
-}
-
-pub fn write_credential(c: &Credential) -> anyhow::Result<()> {
-    let path = credential_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-    let json = serde_json::to_string_pretty(c)?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    // %LOCALAPPDATA% is private to the Windows account already.
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(&path)?;
-    use std::io::Write;
-    f.write_all(json.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
-pub fn forget_credential() {
-    if let Some(p) = credential_path() {
-        let _ = std::fs::remove_file(p);
-    }
-    if let Some(p) = legacy_credential_path() {
-        let _ = std::fs::remove_file(p);
-    }
-    clear_live();
-}
-
-/// 16 random bytes as a v4 UUID string (the mint's idempotency key).
-pub fn new_install_id() -> String {
-    use rand::RngCore;
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let h: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15])
-}
-
-/// The OS name publik's install mint expects.
-fn os_name() -> &'static str {
-    if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }
-}
-
-#[cfg(not(windows))]
-fn os_version() -> Option<String> {
-    let out = std::process::Command::new("sw_vers").arg("-productVersion").output().ok()?;
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if v.is_empty() { None } else { Some(v) }
-}
-
-/// "10.0.22631" from `ver` ("Microsoft Windows [Version 10.0.22631.4317]").
-#[cfg(windows)]
-fn os_version() -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("cmd.exe").args(["/C", "ver"]).creation_flags(CREATE_NO_WINDOW).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let v = text.split("Version").nth(1)?.trim().trim_end_matches(']').trim();
-    let parts: Vec<&str> = v.split('.').take(3).collect();
-    if parts.is_empty() || parts[0].is_empty() { None } else { Some(parts.join(".")) }
-}
-
-#[cfg(not(windows))]
-fn device_name() -> Option<String> {
-    let out = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok()?;
-    let v: String = String::from_utf8_lossy(&out.stdout).trim().chars().take(120).collect();
-    if v.is_empty() { None } else { Some(v) }
-}
-
-#[cfg(windows)]
-fn device_name() -> Option<String> {
-    let v: String = std::env::var("COMPUTERNAME").ok()?.trim().chars().take(120).collect();
-    if v.is_empty() { None } else { Some(v) }
-}
-
-fn arch_name() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        other => other,
-    }
-}
-
 fn header_str(h: &reqwest::header::HeaderMap, k: &str) -> Option<String> {
     h.get(k).and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
@@ -305,7 +504,7 @@ fn err_field<'a>(v: &'a Value, key: &str) -> &'a Value {
     if nested.is_null() { &v[key] } else { nested }
 }
 
-/// Map a non-2xx gateway answer (CONTRACT §1 status codes) to what the UI shows.
+/// Map a non-2xx gateway answer to what the UI shows.
 pub fn map_error(status: u16, headers: &reqwest::header::HeaderMap, body: &str, claim_url_fallback: Option<&str>) -> PublikError {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let kind = err_field(&v, "type").as_str().unwrap_or("").to_string();
@@ -330,7 +529,7 @@ pub fn map_error(status: u16, headers: &reqwest::header::HeaderMap, body: &str, 
         401 | 403 if kind == "key_revoked" => PublikError {
             status,
             kind,
-            message: "This computer was removed from your publik account.".into(),
+            message: "This computer was removed from your publik account. Quit and open GSpot again to sign in.".into(),
             link_label: "Open the publik dashboard".into(),
             link_url: Some(DASHBOARD_URL.into()),
             retry_after_secs: None,
@@ -339,7 +538,7 @@ pub fn map_error(status: u16, headers: &reqwest::header::HeaderMap, body: &str, 
         401 => PublikError {
             status,
             kind: "invalid_api_key".into(),
-            message: "publik API did not accept this computer's key. Turn publik API off and on again in Settings.".into(),
+            message: "publik API did not accept this computer's key. Quit and open GSpot again to sign in.".into(),
             link_label: String::new(),
             link_url: None,
             retry_after_secs: None,
@@ -399,12 +598,7 @@ pub fn note_error(e: &PublikError) {
     with_live(|l| {
         l.unreachable = e.status == 503 || e.status == 0;
         l.exhausted = e.status == 402;
-        l.disconnected = e.kind == "key_revoked";
-        if e.status == 402 {
-            if let Some(a) = Some(e).filter(|_| true) {
-                let _ = a;
-            }
-        }
+        l.disconnected = e.kind == "key_revoked" || e.kind == "invalid_api_key";
         l.notice = Some(Notice {
             kind: match e.status { 402 => "exhausted", 503 | 0 => "unreachable", _ => "error" }.into(),
             message: e.message.clone(),
@@ -426,177 +620,68 @@ pub fn note_transport_error(detail: &str) {
     });
 }
 
-fn client(secs: u64) -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder().timeout(Duration::from_secs(secs)).user_agent(concat!("GSpot/", env!("CARGO_PKG_VERSION"))).build()?)
-}
-
-/// `POST /installs`: mint this computer's key. Only after the disclosure is accepted.
-/// Replays (200 with `key: null`) are retried once with a fresh install id.
-pub async fn provision(install_id: Option<String>) -> Result<Credential, PublikError> {
-    let token = APP_TOKEN.filter(|t| !t.trim().is_empty()).ok_or_else(|| PublikError {
-        status: 0,
-        kind: "no_app_token".into(),
-        message: "publik API is not available in this build (no app token was compiled in). Use your own key or a local model.".into(),
-        link_label: String::new(),
-        link_url: None,
-        retry_after_secs: None,
-        reprovision: false,
-    })?;
-    let base = resolve_base_url("");
-    let mut id = install_id.filter(|s| !s.trim().is_empty()).unwrap_or_else(new_install_id);
-    for attempt in 0..2 {
-        let mut body = json!({
-            "app_token": token,
-            "app_slug": APP_SLUG,
-            "app_version": env!("CARGO_PKG_VERSION"),
-            "os": os_name(),
-            "arch": arch_name(),
-            "install_id": id,
-            "disclosure_version": DISCLOSURE_VERSION,
-            "dialects": ["chat_completions"],
-        });
-        if let Some(v) = os_version() {
-            body["os_version"] = Value::String(v);
-        }
-        if let Some(d) = device_name() {
-            body["device_name"] = Value::String(d);
-        }
-        let c = client(20).map_err(|e| transport(&e.to_string()))?;
-        let res = c.post(format!("{base}/installs")).bearer_auth(token).header("Idempotency-Key", &id).json(&body).send().await.map_err(|e| transport(&e.to_string()))?;
-        let status = res.status().as_u16();
-        let headers = res.headers().clone();
-        let text = res.text().await.unwrap_or_default();
-        if !(200..300).contains(&status) {
-            let mut e = map_error(status, &headers, &text, None);
-            if status == 401 || status == 403 {
-                e.message = "publik could not set up this computer (the app token was not accepted). Use your own key or a local model.".into();
-                e.link_url = None;
-            }
-            return Err(e);
-        }
-        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let key = v["key"].as_str().unwrap_or("").trim().to_string();
-        if key.is_empty() || status == 200 {
-            // Replay of an install id we hold no credential for: mint a fresh one, once.
-            if attempt == 0 {
-                id = new_install_id();
-                continue;
-            }
-            return Err(PublikError { status, kind: "replay".into(), message: "publik did not return a key for this computer. Try again.".into(), link_label: String::new(), link_url: None, retry_after_secs: None, reprovision: false });
-        }
-        let model = v["models"]["balanced"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or(DEFAULT_MODEL).to_string();
-        let cred = Credential {
-            key,
-            base_url: trim_url(v["base_url"].as_str().unwrap_or("")).unwrap_or(base.clone()),
-            install_id: v["install_id"].as_str().unwrap_or(&id).to_string(),
-            app_slug: APP_SLUG.into(),
-            model,
-            claim_url: publik_link(v["claim_url"].as_str()).unwrap_or_default(),
-            add_credit_url: publik_link(v["add_credit_url"].as_str()).unwrap_or_default(),
-            claim_state: v["claim_state"].as_str().unwrap_or("anonymous").to_string(),
-            minted_at: chrono::Utc::now().to_rfc3339(),
-        };
-        let balance = v["balance_micros"].as_i64().or_else(|| v["starter_micros"].as_i64()).unwrap_or(0);
-        with_live(|l| {
-            l.balance_micros = Some(balance);
-            l.claim_state = Some(cred.claim_state.clone());
-            l.exhausted = false;
-            l.unreachable = false;
-            l.disconnected = false;
-            l.notice = None;
-        });
-        return Ok(cred);
-    }
-    unreachable!()
-}
-
-fn transport(detail: &str) -> PublikError {
-    PublikError { status: 0, kind: "transport".into(), message: format!("Could not reach publik ({detail}). Check your internet connection and try again."), link_label: String::new(), link_url: None, retry_after_secs: None, reprovision: false }
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct Wallet {
-    pub balance_micros: i64,
-    pub claim_state: String,
-    pub claim_url: Option<String>,
-    pub add_credit_url: Option<String>,
-    pub top_up_url: Option<String>,
-    pub week_used_micros: Option<i64>,
-    pub week_budget_micros: Option<i64>,
-}
-
-/// `GET /wallet`: the balance line's source of truth when there is no fresh header.
-pub async fn wallet(cred: &Credential) -> Result<Wallet, PublikError> {
-    let c = client(10).map_err(|e| transport(&e.to_string()))?;
-    let res = c.get(format!("{}/wallet", resolve_base_url(&cred.base_url))).bearer_auth(&cred.key).send().await.map_err(|e| transport(&e.to_string()))?;
-    let status = res.status().as_u16();
-    let headers = res.headers().clone();
-    let text = res.text().await.unwrap_or_default();
-    if !(200..300).contains(&status) {
-        let e = map_error(status, &headers, &text, Some(&cred.claim_url));
-        note_error(&e);
-        return Err(e);
-    }
-    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    let balance = v["balance_micros"].as_i64().or_else(|| v["available_micros"].as_i64()).unwrap_or(0);
-    let w = Wallet {
-        balance_micros: balance,
-        claim_state: v["claim_state"].as_str().unwrap_or("anonymous").to_string(),
-        claim_url: publik_link(v["claim_url"].as_str()),
-        add_credit_url: publik_link(v["add_credit_url"].as_str()),
-        top_up_url: publik_link(v["top_up_url"].as_str()),
-        week_used_micros: v["week"]["used_micros"].as_i64(),
-        week_budget_micros: v["week"]["budget_micros"].as_i64(),
-    };
+/// Keep a wallet answer (the gate's at start-up, a refresh since) for the card.
+pub fn remember_wallet(w: &Value) {
+    *WALLET.lock().unwrap() = Some(w.clone());
     with_live(|l| {
-        l.balance_micros = Some(w.balance_micros);
-        l.claim_state = Some(w.claim_state.clone());
-        l.week_used_micros = w.week_used_micros;
-        l.week_budget_micros = w.week_budget_micros;
+        l.balance_micros = w["balance_micros"].as_i64();
+        l.claim_state = w["claim_state"].as_str().map(String::from);
+        l.week_used_micros = w["week"]["used_micros"].as_i64();
+        l.week_budget_micros = w["week"]["budget_micros"].as_i64();
         l.unreachable = false;
         l.disconnected = false;
-        if w.balance_micros > 0 {
+        if has_plan(w) {
             l.exhausted = false;
-            if l.notice.as_ref().map(|n| n.kind == "exhausted").unwrap_or(false) {
+            if l.notice.as_ref().map(|n| n.kind == "exhausted" || n.kind == "unreachable").unwrap_or(false) {
                 l.notice = None;
             }
         }
     });
-    Ok(w)
+}
+
+/// `GET /wallet` now (blocking): the card's source of truth when there is no fresh header.
+pub fn refresh_wallet() {
+    let Some(c) = credential() else { return };
+    match read_wallet(&c.key) {
+        Ok((_, Some(w), _)) => remember_wallet(&w),
+        Ok((code, None, message)) => note_error(&map_error(code, &reqwest::header::HeaderMap::new(), &json!({ "error": { "message": message } }).to_string(), Some(&c.claim_url))),
+        Err(e) => note_transport_error(&e),
+    }
 }
 
 /// One web search through publik API (`POST /search`): links and titles for `q`, at
 /// publik's published price per search. A quoted `q` finds the exact phrase, which is
 /// what the plagiarism check sends.
 pub async fn search(cred: &Credential, q: &str, count: u8) -> Result<Vec<(String, String)>, PublikError> {
-    let c = client(30).map_err(|e| transport(&e.to_string()))?;
-    let res = c
-        .post(format!("{}/search", resolve_base_url(&cred.base_url)))
-        .bearer_auth(&cred.key)
-        .json(&serde_json::json!({"q": q, "count": count}))
-        .send()
-        .await
-        .map_err(|e| transport(&e.to_string()))?;
-    let status = res.status().as_u16();
-    let headers = res.headers().clone();
-    let text = res.text().await.unwrap_or_default();
-    if !(200..300).contains(&status) {
-        let e = map_error(status, &headers, &text, Some(&cred.claim_url));
-        note_error(&e);
-        return Err(e);
+    let (base_url, key, q) = (cred.base_url.clone(), cred.key.clone(), q.to_string());
+    let results = tauri::async_runtime::spawn_blocking(move || search_results(&base_url, &key, &q, count)).await.map_err(|e| transport(&e.to_string()))?;
+    match results {
+        Ok(items) => Ok(items.iter().filter_map(|r| Some((r["url"].as_str()?.to_string(), r["title"].as_str().unwrap_or("").to_string()))).collect()),
+        Err((message, top_up_url)) => {
+            let status = if top_up_url.is_some() || message.starts_with("Not enough") { 402 } else if message.contains("not reachable") { 0 } else { 500 };
+            let e = PublikError {
+                status,
+                kind: if status == 402 { "insufficient_credit".into() } else if status == 0 { "transport".into() } else { "http".into() },
+                message,
+                link_label: if status == 402 { CTA_ADD_PLAN.into() } else { String::new() },
+                link_url: if status == 402 { publik_link(top_up_url.as_deref()).or_else(|| Some(DASHBOARD_URL.into())) } else { None },
+                retry_after_secs: None,
+                reprovision: false,
+            };
+            note_error(&e);
+            Err(e)
+        }
     }
-    note_response(&headers);
-    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    Ok(v["results"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|r| Some((r["url"].as_str()?.to_string(), r["title"].as_str().unwrap_or("").to_string()))).collect())
-        .unwrap_or_default())
+}
+
+fn transport(detail: &str) -> PublikError {
+    PublikError { status: 0, kind: "transport".into(), message: format!("Could not reach publik ({detail}). Check your internet connection and try again."), link_label: String::new(), link_url: None, retry_after_secs: None, reprovision: false }
 }
 
 /// The credential the plagiarism check searches with: only when publik API is the
 /// chosen provider. A user on their own model key keeps the keyless chain.
 pub fn search_credential(settings: &crate::settings::Settings) -> Option<Credential> {
-    if settings.llm.provider == crate::settings::Provider::Publik { read_credential() } else { None }
+    if settings.llm.provider == crate::settings::Provider::Publik { credential() } else { None }
 }
 
 /// "$0.0004" / "$1.23".
@@ -609,43 +694,49 @@ pub fn fmt_usd(micros: i64) -> String {
     }
 }
 
-/// The balance line: "$0.00 · link this computer for $0.05 of free use" while
-/// anonymous, else the live balance.
-pub fn balance_line(balance_micros: Option<i64>, claim_state: &str) -> String {
+/// The balance line: the plan when there is one, else the live balance ("$0.41 left"),
+/// or "sign in with publik" while the computer is not signed in.
+pub fn balance_line(balance_micros: Option<i64>, claim_state: &str, plan_label: Option<&str>) -> String {
+    if let Some(label) = plan_label {
+        return format!("Your plan: {label}");
+    }
     let b = fmt_usd(balance_micros.unwrap_or(0));
     if claim_state == "claimed" {
         format!("{b} left")
     } else {
-        format!("{b} · link this computer for $0.05 of free use")
+        format!("{b} · sign in with publik to use it")
     }
 }
 
-/// Everything the UI renders about publik API, from the credential + live state.
+/// Everything the UI renders about publik API, from the credential, the wallet and the live state.
 pub fn status(settings: &crate::settings::Settings) -> Value {
-    let cred = read_credential();
+    let cred = credential();
     let l = live();
-    let claim_state = l.claim_state.clone().or_else(|| cred.as_ref().map(|c| c.claim_state.clone())).filter(|s| !s.is_empty()).unwrap_or_else(|| "anonymous".into());
+    let w = WALLET.lock().unwrap().clone();
+    let claim_state = l.claim_state.clone().or_else(|| w.as_ref().and_then(|w| w["claim_state"].as_str().map(String::from))).filter(|s| !s.is_empty()).unwrap_or_else(|| "anonymous".into());
     let claimed = claim_state == "claimed";
-    let claim_url = cred.as_ref().map(|c| c.claim_url.clone()).filter(|u| !u.is_empty());
-    let add_credit_url = cred.as_ref().map(|c| c.add_credit_url.clone()).filter(|u| !u.is_empty()).unwrap_or_else(|| "https://publikhq.com/dashboard/api/add".into());
-    let cta_url = if claimed { add_credit_url.clone() } else { claim_url.clone().unwrap_or_else(|| DASHBOARD_URL.into()) };
+    let plan_label = w.as_ref().filter(|w| w["plan"]["kind"] == "plan").map(|w| w["plan"]["label"].as_str().unwrap_or("publik").to_string());
+    let balance = l.balance_micros.or_else(|| w.as_ref().and_then(|w| w["balance_micros"].as_i64()));
+    let top_up_url = w.as_ref().and_then(|w| publik_link(w["top_up_url"].as_str())).unwrap_or_else(|| "https://publikhq.com/wallet".into());
+    let claim_url = cred.as_ref().map(|c| c.claim_url.clone()).filter(|u| !u.is_empty()).unwrap_or_else(|| DASHBOARD_URL.into());
+    let cta_url = if claimed { top_up_url } else { claim_url };
     let selected = settings.llm.provider == crate::settings::Provider::Publik;
     let state = match (&cred, l.disconnected, l.exhausted, l.unreachable) {
-        (None, _, _, _) => "not_set_up",
+        (None, ..) => "not_set_up",
         (_, true, _, _) => "disconnected",
         (_, _, true, _) => "needs_credit",
         (_, _, _, true) => "unreachable",
         _ => "ready",
     };
     json!({
-        "available": can_provision() || cred.is_some(),
-        "can_provision": can_provision(),
+        "available": !APP_TOKEN.trim().is_empty() || cred.is_some(),
+        "can_provision": !APP_TOKEN.trim().is_empty(),
         "has_key": cred.is_some(),
         "selected": selected,
         "state": state,
         "claim_state": claim_state,
-        "balance_micros": l.balance_micros,
-        "balance_line": balance_line(l.balance_micros, &claim_state),
+        "balance_micros": balance,
+        "balance_line": balance_line(balance, &claim_state, plan_label.as_deref()),
         "last_charge_label": l.last_charge_micros.map(|m| format!("last request {}", fmt_usd(m))),
         "week_label": match (l.week_used_micros, l.week_budget_micros) { (Some(u), Some(b)) if b > 0 => Some(format!("This week {} of {}", fmt_usd(u), fmt_usd(b))), _ => None },
         "model": cred.as_ref().map(|c| c.model.clone()).unwrap_or_else(|| DEFAULT_MODEL.into()),
@@ -660,9 +751,38 @@ pub fn status(settings: &crate::settings::Settings) -> Value {
     })
 }
 
+/// The gate's answer, applied to Settings → AI once at start-up: "publik" selects publik API;
+/// "own_key" keeps an own-key provider as it is, and moves the publik default to the own-key
+/// card, which then asks for the key.
+pub fn apply_choice(settings: &mut crate::settings::Settings, choice: Option<&str>) {
+    let publik = crate::settings::Provider::Publik;
+    match choice {
+        Some("publik") => {
+            if settings.llm.provider != publik {
+                settings.llm = crate::settings::LlmConfig::default();
+            }
+        }
+        Some("own_key") => {
+            if settings.llm.provider == publik {
+                settings.llm = crate::settings::LlmConfig { provider: crate::settings::Provider::OpenAI, base_url: "https://api.openai.com".into(), api_key: String::new(), model: "gpt-4o-mini".into() };
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Settings → AI changed the provider: store the same answer in the credential file, so the
+/// gate does not ask again at the next start.
+pub fn sync_choice(before: &crate::settings::Provider, after: &crate::settings::Provider) {
+    if before != after {
+        set_choice(Some(if *after == crate::settings::Provider::Publik { "publik" } else { "own_key" }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{LlmConfig, Provider, Settings};
 
     #[test]
     fn links_only_on_publikhq() {
@@ -681,18 +801,31 @@ mod tests {
     }
 
     #[test]
-    fn balance_line_follows_claim_state() {
-        assert_eq!(balance_line(None, "anonymous"), "$0.00 · link this computer for $0.05 of free use");
-        assert_eq!(balance_line(Some(410_000), "claimed"), "$0.41 left");
+    fn balance_line_follows_the_plan_and_the_claim_state() {
+        assert_eq!(balance_line(Some(410_000), "claimed", None), "$0.41 left");
+        assert_eq!(balance_line(Some(0), "claimed", Some("Plus")), "Your plan: Plus");
+        assert_eq!(balance_line(None, "anonymous", None), "$0.00 · sign in with publik to use it");
     }
 
     #[test]
-    fn install_ids_are_v4_uuids() {
-        let id = new_install_id();
-        assert_eq!(id.len(), 36);
-        assert_eq!(id.as_bytes()[14], b'4');
-        assert!(matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
-        assert_ne!(id, new_install_id());
+    fn the_gate_screens_carry_the_contract_words() {
+        let anonymous = json!({ "claim_state": "anonymous", "plan": { "kind": "none" }, "balance_micros": 0 });
+        let s = gate_screen("sign_in", Some(&anonymous), None, None);
+        assert_eq!(s.title, "Sign in with publik");
+        assert_eq!(s.buttons, vec![("sign_in", "Sign in with publik")]);
+        let s = gate_screen("unreachable", None, None, None);
+        assert_eq!(s.body, "publik is not reachable. Check your connection.");
+        assert_eq!(s.buttons, vec![("retry", "Retry")]);
+        let empty = json!({ "claim_state": "claimed", "account": { "handle": "mann" }, "plan": { "kind": "none" }, "balance_micros": 0 });
+        let s = gate_screen("choose", Some(&empty), None, None);
+        assert_eq!(s.title, "Choose how to pay for AI");
+        assert_eq!(s.body, "You are signed in as @mann. This app uses AI. Get a publik plan, or use your own key.");
+        assert_eq!(s.buttons, vec![("get_plan", "Get a plan"), ("own_key", "Use my own key")]);
+        let plan = json!({ "claim_state": "claimed", "account": { "handle": "mann" }, "plan": { "kind": "plan", "label": "Plus" }, "balance_micros": 0 });
+        let s = gate_screen("choose", Some(&plan), None, None);
+        assert_eq!(s.title, "Connect your plan");
+        assert_eq!(s.body, "You are signed in as @mann. Your plan: Plus. Connect it to use AI in this app, or use your own key.");
+        assert_eq!(s.buttons, vec![("connect", "Connect your plan"), ("own_key", "Use my own key")]);
     }
 
     #[test]
@@ -727,27 +860,24 @@ mod tests {
     }
 
     #[test]
-    fn credential_round_trips_and_defaults_model() {
-        let c = Credential { key: "pk_live_abc".into(), base_url: "https://publikhq.com/api/v1/".into(), ..Default::default() };
-        let j = serde_json::to_string(&c).unwrap();
-        let back: Credential = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.key, "pk_live_abc");
-        assert_eq!(resolve_base_url(&back.base_url), "https://publikhq.com/api/v1");
+    fn base_url_resolves_to_the_default() {
+        assert_eq!(resolve_base_url("https://publikhq.com/api/v1/"), "https://publikhq.com/api/v1");
         assert_eq!(resolve_base_url(""), DEFAULT_BASE_URL);
     }
 
     #[test]
-    fn headers_update_the_live_balance() {
-        clear_live();
-        let mut h = reqwest::header::HeaderMap::new();
-        h.insert("x-publik-balance", "41000".parse().unwrap());
-        h.insert("x-publik-charge-micros", "120".parse().unwrap());
-        h.insert("x-publik-claim-state", "claimed".parse().unwrap());
-        note_response(&h);
-        let l = live();
-        assert_eq!(l.balance_micros, Some(41000));
-        assert_eq!(l.last_charge_micros, Some(120));
-        assert_eq!(l.claim_state.as_deref(), Some("claimed"));
-        clear_live();
+    fn the_choice_moves_the_provider_once() {
+        let mut s = Settings::default();
+        assert_eq!(s.llm.provider, Provider::Publik);
+        apply_choice(&mut s, Some("own_key"));
+        assert_eq!(s.llm.provider, Provider::OpenAI);
+        assert_eq!(s.llm.api_key, "");
+        apply_choice(&mut s, Some("publik"));
+        assert_eq!(s.llm.provider, Provider::Publik);
+        // An own key the person already pasted stays as it is.
+        s.llm = LlmConfig { provider: Provider::Anthropic, base_url: "https://api.anthropic.com".into(), api_key: "sk-ant-x".into(), model: "m".into() };
+        apply_choice(&mut s, Some("own_key"));
+        assert_eq!(s.llm.provider, Provider::Anthropic);
+        assert_eq!(s.llm.api_key, "sk-ant-x");
     }
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 (2026-11-10)
+
+Sign in with publik.
+
+- GSpot opens with "Sign in with publik". The button opens your browser, and the window continues when you are signed in. There is no way past it. Offline, it says "publik is not reachable. Check your connection." with a Retry button.
+- After sign-in: "Choose how to pay for AI" (Get a plan, Use my own key), or "Connect your plan" (Connect your plan, Use my own key) when your account has a plan or a balance. The answer is kept. Settings → AI changes it later.
+- Your own key works as before (OpenAI, Anthropic, OpenRouter, Groq, Google).
+- Usage counts (`app_opened`, `active_session`) now carry this computer's publik key, so a signed-in person is counted once. `DO_NOT_TRACK=1` still turns them off.
+- One publik module (`src-tauri/src/publik.rs`) replaces the old key provisioning and the vendored telemetry client.
+
 ## 0.2.0 (2026-11-08)
 
 GSpot for Windows.

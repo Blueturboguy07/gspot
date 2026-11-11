@@ -280,6 +280,7 @@ if ($ffmpeg) {
 }
 
 $app = $null
+$fake = $null
 try {
   # --- 1. Install --------------------------------------------------------------------
   Log "installing $Installer"
@@ -304,6 +305,42 @@ try {
   }
 
   # --- 3. Start GSpot with the debug probe ----------------------------------------------
+  # GSpot opens with "Sign in with publik" and waits for GET /wallet to say "claimed". The runner
+  # has no publik account, so a fake publik answers on the next port, and a fake signed-in
+  # credential (own key chosen) is written first. No real key or token is involved.
+  $fakePort = $Port + 1
+  $fake = Start-Job -ArgumentList $fakePort -ScriptBlock {
+    param($p)
+    $l = New-Object System.Net.HttpListener
+    $l.Prefixes.Add("http://127.0.0.1:$p/")
+    $l.Start()
+    while ($true) {
+      $c = $l.GetContext()
+      $path = $c.Request.Url.AbsolutePath
+      $body = ""
+      if ($path -eq "/api/v1/wallet") {
+        $c.Response.StatusCode = 200
+        $body = '{"claim_state":"claimed","balance_micros":0,"plan":{"kind":"plan","label":"CI plan"},"account":{"handle":"ci"},"top_up_url":"https://publikhq.com/wallet"}'
+      } elseif ($path -eq "/api/v1/installs") {
+        $c.Response.StatusCode = 201
+        $body = '{"key":"pk_ci_fake","base_url":"http://127.0.0.1:' + $p + '/api/v1","install_id":"00000000-0000-4000-8000-000000000000","claim_url":"https://publikhq.com/claim/CI"}'
+      } else {
+        $c.Response.StatusCode = 204
+      }
+      if ($body) {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $c.Response.ContentType = "application/json"
+        $c.Response.ContentLength64 = $bytes.Length
+        $c.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+      }
+      $c.Response.Close()
+    }
+  }
+  $publikApps = Join-Path $env:LOCALAPPDATA "publik\apps"
+  New-Item -ItemType Directory -Force $publikApps | Out-Null
+  '{"key":"pk_ci_fake","base_url":"http://127.0.0.1:' + $fakePort + '/api/v1","install_id":"00000000-0000-4000-8000-000000000000","claim_url":"https://publikhq.com/claim/CI","choice":"own_key"}' | Set-Content (Join-Path $publikApps "gspot.json") -Encoding ASCII
+  $env:PUBLIK_ORIGIN = "http://127.0.0.1:$fakePort"
+  Note "sign-in gate" "fake publik on port $fakePort answers GET /wallet as claimed; own key chosen"
   $env:GRAMMARLAMA_DEBUG_PORT = "$Port"
   $env:DO_NOT_TRACK = "1"
   $env:RUST_LOG = "info"
@@ -516,6 +553,7 @@ try {
   Shot "fail-final"
 } finally {
   if ($app) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue }
+  if ($fake) { Stop-Job $fake -ErrorAction SilentlyContinue; Remove-Job $fake -Force -ErrorAction SilentlyContinue }
   if ($rec -and -not $rec.HasExited) {
     try { $rec.StandardInput.Write("q"); $rec.StandardInput.Flush() } catch { }
     if (-not $rec.WaitForExit(15000)) { $rec.Kill() }
