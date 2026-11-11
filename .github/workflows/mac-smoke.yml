@@ -44,7 +44,40 @@ jobs:
           spctl -a -vv -t exec /Applications/GSpot.app 2>&1 | tee out/spctl-app.txt
           grep -q "source=Notarized Developer ID" out/spctl-app.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/GSpot.app/Contents/Info.plist | tee out/version.txt
-          GRAMMARLAMA_DEBUG_PORT=47331 /Applications/GSpot.app/Contents/MacOS/grammarlama > out/gspot.log 2>&1 &
+          # GSpot opens with "Sign in with publik" and waits for GET /wallet to say "claimed". The runner
+          # has no publik account, so a fake publik answers on the next port, and a fake signed-in
+          # credential (own key chosen) is written first. No real key or token is involved.
+          # The same shape as tests/e2e/windows/e2e.ps1.
+          cat > fake-publik.py <<'PY'
+          import json, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          PORT = int(sys.argv[1])
+          WALLET = {"claim_state": "claimed", "balance_micros": 0, "plan": {"kind": "plan", "label": "CI plan"}, "account": {"handle": "ci"}, "top_up_url": "https://publikhq.com/wallet"}
+          INSTALL = {"key": "pk_ci_fake", "base_url": f"http://127.0.0.1:{PORT}/api/v1", "install_id": "00000000-0000-4000-8000-000000000000", "claim_url": "https://publikhq.com/claim/CI"}
+          class H(BaseHTTPRequestHandler):
+              def _send(self, code, body=None):
+                  self.send_response(code)
+                  if body is None:
+                      self.end_headers(); return
+                  data = json.dumps(body).encode()
+                  self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(data))); self.end_headers()
+                  self.wfile.write(data)
+              def do_GET(self):
+                  self._send(200, WALLET) if self.path == "/api/v1/wallet" else self._send(204)
+              def do_POST(self):
+                  self.rfile.read(int(self.headers.get("content-length") or 0))
+                  self._send(201, INSTALL) if self.path == "/api/v1/installs" else self._send(204)
+              def log_message(self, *a): pass
+          HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+          PY
+          python3 fake-publik.py 47332 > out/fake-publik.log 2>&1 &
+          echo $! > out/fake-pid
+          APPS="$HOME/Library/Application Support/publik/apps"
+          mkdir -p "$APPS"
+          printf '%s' '{"key":"pk_ci_fake","base_url":"http://127.0.0.1:47332/api/v1","install_id":"00000000-0000-4000-8000-000000000000","claim_url":"https://publikhq.com/claim/CI","choice":"own_key"}' > "$APPS/gspot.json"
+          for i in $(seq 1 20); do curl -s -o /dev/null http://127.0.0.1:47332/api/v1/wallet && break; sleep 1; done
+          echo "fake publik on port 47332 answers GET /wallet as claimed; own key chosen"
+          PUBLIK_ORIGIN=http://127.0.0.1:47332 GRAMMARLAMA_DEBUG_PORT=47331 /Applications/GSpot.app/Contents/MacOS/grammarlama > out/gspot.log 2>&1 &
           echo $! > out/pid
           for i in $(seq 1 60); do
             if curl -s -X POST http://127.0.0.1:47331/health > out/health.json 2>/dev/null && grep -q '"ok":true' out/health.json; then break; fi
@@ -75,6 +108,7 @@ jobs:
           screencapture -x out/panel.png || echo "screencapture unavailable"
           curl -s -X POST $P/state | python3 -c 'import json,sys; d=json.load(sys.stdin); print("panel:", d["panel"]); assert d["panel"]["visible"]'
           kill "$(cat out/pid)" || true
+          kill "$(cat out/fake-pid)" || true
 
       - uses: actions/upload-artifact@v4
         if: always()
