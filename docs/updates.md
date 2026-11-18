@@ -109,7 +109,7 @@ The public key is compiled into each copy, so a new key reaches users only throu
 Run `updater-proof.yml` (workflow_dispatch). It builds 0.0.1 and 0.0.2, installs 0.0.1 on
 `macos-latest` and `windows-latest`, and checks that 0.0.1 refuses three bad feeds and then
 updates to 0.0.2. Then it starts 0.0.1 once more and checks that the restart question is on
-screen while the app keeps running. A push to `feat/updater` or `updater/**` also starts it.
+screen while the app keeps running.
 
 The app has a test hook for this: `PUBLIK_UPDATE_SELF_TEST=version|check|install` runs the
 updater with no window and no prompt and prints one JSON line. `prompt` runs the background
