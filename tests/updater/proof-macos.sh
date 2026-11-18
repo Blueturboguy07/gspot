@@ -29,7 +29,9 @@ plist() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist"; }
 cdhash() { codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'; }
 dr() { codesign -d -r- "$1" 2>&1 | sed -n 's/^designated => //p'; }
 leaf() { local d; d="$(mktemp -d)"; (cd "$d" && codesign -d --extract-certificates "$1" >/dev/null 2>&1 && shasum -a 256 codesign0 | cut -d' ' -f1); rm -rf "$d"; }
-# On-screen windows owned by a process (CGWindowList; no permission needed for owner and count).
+# On-screen windows owned by a process or by UserNotificationCenter (CGWindowList; no permission
+# needed for owner and count). The dialog plugin (rfd) shows a question without a parent window
+# with CFUserNotificationDisplayAlert, so macOS draws it in UserNotificationCenter, not in the app.
 # A compiled Swift helper first, then the same call through JXA. Errors go to $OUT/windows.log.
 build_windows_helper() {
   cat > "$WORK/wins.swift" <<'EOF'
@@ -37,9 +39,12 @@ import Foundation
 import CoreGraphics
 let pid = Int(CommandLine.arguments[1])!
 let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as NSArray?) as? [NSDictionary] ?? []
-let mine = list.filter { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.intValue == pid }
-let owners = Set(list.compactMap { $0[kCGWindowOwnerName as String] as? String }).sorted()
-FileHandle.standardError.write("swift: \(list.count) on-screen windows, \(mine.count) of pid \(pid); owners: \(owners)\n".data(using: .utf8)!)
+let mine = list.filter {
+  ($0[kCGWindowOwnerPID as String] as? NSNumber)?.intValue == pid
+    || ($0[kCGWindowOwnerName as String] as? String) == "UserNotificationCenter"
+}
+let names = mine.map { "\($0[kCGWindowOwnerName as String] ?? "?"):\($0[kCGWindowName as String] ?? "")" }
+FileHandle.standardError.write("swift: \(list.count) on-screen windows, \(mine.count) of pid \(pid) or UserNotificationCenter \(names)\n".data(using: .utf8)!)
 print(mine.count)
 EOF
   cat > "$WORK/wins.js" <<'EOF'
@@ -47,7 +52,7 @@ ObjC.import('CoreGraphics');
 function run(argv) {
   const pid = parseInt(argv[0], 10);
   const list = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly, $.kCGNullWindowID))) || [];
-  return String(list.filter(w => w.kCGWindowOwnerPID === pid).length);
+  return String(list.filter(w => w.kCGWindowOwnerPID === pid || w.kCGWindowOwnerName === 'UserNotificationCenter').length);
 }
 EOF
   swiftc -O -o "$WORK/wins" "$WORK/wins.swift" >> "$OUT/windows.log" 2>&1 || echo "swiftc failed" >> "$OUT/windows.log"
@@ -185,6 +190,7 @@ check "[good] N+1 finds no newer version" "$(field "$OUT/r-check-after.jsonl" re
 echo "==> The restart question, from N again (the background check as users get it)"
 rm -rf "$INSTALLED"; ditto "$WORK/N.app" "$INSTALLED"
 R="$OUT/r-prompt.jsonl"; rm -f "$R"
+BEFORE="$(windows_of 0)"
 PUBLIK_UPDATE_SELF_TEST=prompt PUBLIK_UPDATE_SELF_TEST_OUT="$R" "$BIN" > "$R.stdout" 2> "$R.log" &
 APP_PID=$!
 for _ in $(seq 1 120); do grep -q '"asking"' "$R" 2>/dev/null && break; kill -0 "$APP_PID" 2>/dev/null || break; sleep 1; done
@@ -195,10 +201,12 @@ check "[prompt] N asks to restart and keeps running (no forced restart)" "result
 check "[prompt] N+1 is already installed in the background" "$(plist "$INSTALLED" CFBundleShortVersionString), waits_for_yes=$(field "$R" install_waits_for_yes)" \
   test "$(plist "$INSTALLED" CFBundleShortVersionString)" = "$N1"
 WINS=0
-for _ in $(seq 1 10); do WINS="$(windows_of "$APP_PID")"; [ "${WINS:-0}" -ge 1 ] 2>/dev/null && break; sleep 1; done
-check "[prompt] the question is on screen" "$WINS window(s) of the app" test "${WINS:-0}" -ge 1
+for _ in $(seq 1 10); do WINS="$(windows_of "$APP_PID")"; [ "${WINS:-0}" -gt "${BEFORE:-0}" ] 2>/dev/null && break; sleep 1; done
+check "[prompt] the question is on screen" "$WINS window(s) of the app or its system alert, $BEFORE before launch" \
+  test "${WINS:-0}" -gt "${BEFORE:-0}"
 screencapture -x "$OUT/prompt-macos.png" 2>/dev/null || echo "screencapture unavailable"
 kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true
+sleep 2; echo "after the app quit: $(windows_of 0)" >> "$OUT/windows.log"
 
 security delete-keychain "$KC" 2>/dev/null || true
 rm -rf "$INSTALLED"
