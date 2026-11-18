@@ -30,10 +30,25 @@ function Last([string]$file) {
   if ($lines.Count -eq 0) { return $null }
   return $lines[-1] | ConvertFrom-Json
 }
+function Shot([string]$name) {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+    $bmp.Save((Join-Path $Out "$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+    $g.Dispose(); $bmp.Dispose()
+  } catch { Write-Host "screenshot $name failed: $_" }
+}
 function Version-Of([string]$base) { return ($base -replace '^GSpot_', '' -replace '_x64-setup\.exe$', '') }
 function Installed-Exe { Get-ChildItem (Join-Path $env:LOCALAPPDATA "GSpot") -Filter *.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "uninstall*" } | Select-Object -First 1 }
 function Disk-Version { $e = Installed-Exe; if ($e) { return $e.VersionInfo.ProductVersion } else { return "" } }
 function Reg-Version { $r = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "GSpot*" } | Select-Object -First 1; if ($r) { return $r.DisplayVersion } else { return "" } }
+# The updater writes the installer to %TEMP%\<App>-<version>-updater-*\<App>-<version>-installer.exe
+# and runs it from there (names from tauri-plugin-updater).
+function Updater-Installers { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*-$vN1-installer" } }
+function Updater-TempDirs { Get-ChildItem $env:TEMP -Directory -Filter "*-$vN1-updater-*" -ErrorAction SilentlyContinue }
 function Stop-App { Get-Process -Name grammarlama, GSpot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep 1 }
 # Runs the installed app's self-test; returns the exit code (124 on a 180 s timeout).
 function SelfTest([string]$mode, [string]$report) {
@@ -100,21 +115,23 @@ foreach ($case in @("badsig", "tampered", "version")) {
   Start-Sleep 3
   Check "[$case] the update is refused (exit 2)" ($rc -eq 2 -and $r.result -eq "error") "exit=$rc; $($r.error)"
   Check "[$case] refused for the right reason" ("$($r.error)" -like "*$($reasons[$case])*") $reasons[$case]
-  Check "[$case] no installer ran" ($null -eq (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*installer*" -or $_.Name -like "*-setup*" })) ""
+  $dirs = @(Updater-TempDirs)
+  Check "[$case] no installer was written or started" ($null -eq (Updater-Installers) -and $dirs.Count -eq 0) "temp dirs: $($dirs.Count)"
   Check "[$case] the app on disk is still N" ((Disk-Version) -like "$vN*" -and (Get-FileHash (Installed-Exe).FullName).Hash -eq $hashBefore) "$(Disk-Version)"
 }
 
 Copy-Item "$Feed\latest-good.json" "$Feed\latest.json" -Force
 $rc = SelfTest "install" "$Out\r-install.jsonl"; $r = Last "$Out\r-install.jsonl"
+$selfTestPid = $r.pid
 Check "[good] N downloads and verifies N+1, then starts its installer and exits" ($rc -eq 0 -and $r.result -eq "installing" -and $r.new_version -eq $vN1) "exit=$rc result=$($r.result) new=$($r.new_version)"
 # The installer (passive: a progress bar, no questions) replaces the app and opens it again.
 $deadline = (Get-Date).AddSeconds(180)
 while ((Get-Date) -lt $deadline) {
-  $busy = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*installer*" }
+  $busy = Updater-Installers
   if ((Disk-Version) -like "$vN1*" -and -not $busy) { break }
   Start-Sleep 2
 }
-Get-Process -Name grammarlama, GSpot, "*installer*" -ErrorAction SilentlyContinue | Select-Object Name, Id, Path | Format-Table -AutoSize | Out-String | Set-Content "$Out\processes-after-install.txt"
+Get-Process -Name grammarlama, GSpot, "*-$vN1-installer" -ErrorAction SilentlyContinue | Select-Object Name, Id, Path | Format-Table -AutoSize | Out-String | Set-Content "$Out\processes-after-install.txt"
 Start-Sleep 10
 # The installer reopens the app with the same environment, so the reopened app runs the
 # self-test too and appends its own line (evidence of the restart; informational).
@@ -122,6 +139,10 @@ $lines = @(Get-Content "$Out\r-install.jsonl" | Where-Object { $_.Trim() } | For
 $reopened = $lines | Where-Object { $_.version -eq $vN1 } | Select-Object -First 1
 Write-Host "reopened by the installer: $(if ($reopened) { "yes, reported $($reopened.version) result=$($reopened.result)" } else { 'no self-test line (the app may have opened normally)' })"
 "reopened_report=$(if ($reopened) { $reopened | ConvertTo-Json -Compress } else { 'none' })" | Set-Content "$Out\reopen.txt"
+# The installer ran with /R: GSpot must be running again, as a new process, from the install folder.
+$again = @(Get-Process -Name grammarlama -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $selfTestPid -and $_.Path -like "$env:LOCALAPPDATA\GSpot\*" })
+Check "[good] the installer opened GSpot again (restart after install)" ($again.Count -ge 1 -or $null -ne $reopened) "pids: $(($again | ForEach-Object Id) -join ',')"
+Check "[good] the installer has finished" ($null -eq (Updater-Installers)) ""
 Stop-App
 Check "[good] the exe on disk is N+1" ((Disk-Version) -like "$vN1*") "$(Disk-Version)"
 Check "[good] the uninstall entry says N+1" ((Reg-Version) -eq $vN1) "$(Reg-Version)"
@@ -131,9 +152,32 @@ $rc = SelfTest "check" "$Out\r-check-after.jsonl"; $r = Last "$Out\r-check-after
 Check "[good] N+1 finds no newer version" ($r.result -eq "none") "$($r.result)"
 Check "[good] one install of GSpot, not two" (@(Get-ChildItem (Join-Path $env:LOCALAPPDATA "GSpot") -Filter *.exe | Where-Object { $_.Name -notlike "uninstall*" }).Count -eq 1) ""
 
+Write-Host "==> The restart question, from N again (the background check as users get it)"
+Stop-App
+$un = Join-Path $env:LOCALAPPDATA "GSpot\uninstall.exe"
+if (Test-Path $un) { Start-Process $un -ArgumentList "/S" -Wait }
+Start-Sleep 2
+Start-Process -FilePath $N -ArgumentList "/S" -Wait
+Stop-App
+$hashN = (Get-FileHash (Installed-Exe).FullName).Hash
+$report = "$Out\r-prompt.jsonl"
+Remove-Item $report -ErrorAction SilentlyContinue
+$env:PUBLIK_UPDATE_SELF_TEST = "prompt"; $env:PUBLIK_UPDATE_SELF_TEST_OUT = $report
+$p = Start-Process -FilePath (Installed-Exe).FullName -PassThru -RedirectStandardOutput "$report.stdout" -RedirectStandardError "$report.log"
+Remove-Item Env:PUBLIK_UPDATE_SELF_TEST, Env:PUBLIK_UPDATE_SELF_TEST_OUT
+$deadline = (Get-Date).AddSeconds(120)
+while ((Get-Date) -lt $deadline -and -not $p.HasExited -and -not ((Test-Path $report) -and ((Get-Content $report -Raw) -match '"asking"'))) { Start-Sleep 1 }
+Start-Sleep 5
+$r = Last $report
+$p.Refresh()
+Check "[prompt] N asks and keeps running (no forced restart)" ($r.result -eq "asking" -and -not $p.HasExited -and $r.version -eq $vN) "result=$($r.result) running=$(-not $p.HasExited) version=$($r.version)"
+Check "[prompt] nothing is installed before a yes" ((Disk-Version) -like "$vN*" -and (Get-FileHash (Installed-Exe).FullName).Hash -eq $hashN -and $r.install_waits_for_yes -eq $true) "$(Disk-Version), waits_for_yes=$($r.install_waits_for_yes)"
+Check "[prompt] the question is on screen" ("$($p.MainWindowTitle)" -like "*update*") "window title '$($p.MainWindowTitle)'"
+Shot "prompt-windows"
+Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
 Stop-App
 Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
-$un = Join-Path $env:LOCALAPPDATA "GSpot\uninstall.exe"
 if (Test-Path $un) { Start-Process $un -ArgumentList "/S" -Wait }
 Write-Host ""
 Write-Host "$($script:pass) passed, $($script:fails) failed"

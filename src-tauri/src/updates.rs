@@ -9,10 +9,11 @@
 //! - Every package is checked against the public key in tauri.conf.json before it is used, and
 //!   its signature must name the version the feed announces (`requireSignedVersion`).
 //! - macOS: the new .app is downloaded, verified and swapped in place in the background. Then the
-//!   app asks to restart. Windows: the installer is downloaded and verified in the background.
-//!   Then the app asks, and "Restart and Install" runs the installer in passive mode (a progress
-//!   bar, no questions): it closes the app, updates it and opens it again. Nothing restarts
-//!   without a yes.
+//!   app asks to restart. When this user cannot replace the app (installed by another user), the
+//!   swap waits for "Install and Restart", because it then asks for an admin password.
+//!   Windows: the installer is downloaded and verified in the background. Then the app asks, and
+//!   "Restart and Install" runs the installer in passive mode (a progress bar, no questions): it
+//!   closes the app, updates it and opens it again. Nothing restarts without a yes.
 //! - A background check that fails writes to the log only. A manual check shows the error.
 //!
 //! Build-time override: `PUBLIK_UPDATE_ENDPOINT` (one URL or a comma-separated list, read with
@@ -22,6 +23,8 @@
 //! no prompt, runs the same check/download/verify/install code, writes one JSON line to stdout
 //! and appends it to the file named by `PUBLIK_UPDATE_SELF_TEST_OUT`, then exits.
 //! Exit codes: 0 = done (installed, up to date, or version), 2 = the update failed or was refused.
+//! `prompt` runs the background check as it is and leaves the restart question open (the test
+//! looks at it and closes the app).
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -46,13 +49,13 @@ const SELF_TEST_OUT_ENV: &str = "PUBLIK_UPDATE_SELF_TEST_OUT";
 /// Set at build time only. A running app never reads its endpoint from the environment.
 const ENDPOINT_OVERRIDE: Option<&str> = option_env!("PUBLIK_UPDATE_ENDPOINT");
 
-/// An update that is downloaded and verified, and on macOS already installed.
+/// An update that is downloaded and verified.
 struct Ready {
     version: String,
-    #[cfg_attr(not(windows), allow(dead_code))]
     update: Update,
-    /// Windows: the verified installer, run on "Restart and Install". macOS: none (installed).
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// The verified package while it is not installed yet: always on Windows (the installer runs
+    /// on "Restart and Install"), and on macOS when this user cannot replace the app in place.
+    /// None: installed in the background, a restart is all that is left.
     package: Option<Vec<u8>>,
 }
 
@@ -144,8 +147,8 @@ fn updater(app: &AppHandle) -> Result<Updater, String> {
     builder.build().map_err(|e| e.to_string())
 }
 
-/// Check, download and verify; on macOS also install. The one code path behind the automatic
-/// check, the menu item and the self-test.
+/// Check, download and verify; on macOS also install when this user can replace the app. The one
+/// code path behind the automatic check, the menu item and the self-test.
 async fn fetch(app: &AppHandle) -> Result<Found, String> {
     let Some(update) = updater(app)?.check().await.map_err(|e| e.to_string())? else {
         return Ok(Found::UpToDate(app.package_info().version.to_string()));
@@ -156,16 +159,44 @@ async fn fetch(app: &AppHandle) -> Result<Found, String> {
     }
     // `download` verifies the signature (and the signed version) before it returns the bytes.
     let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
-    #[cfg(windows)]
-    let package = Some(bytes);
-    #[cfg(not(windows))]
-    let package = {
+    #[cfg(target_os = "macos")]
+    let package = if can_replace_in_place() {
         // Verifies again, then swaps the new bundle in place. The running app is not touched.
         update.install(&bytes).map_err(|e| e.to_string())?;
         None
+    } else {
+        Some(bytes)
     };
+    #[cfg(not(target_os = "macos"))]
+    let package = Some(bytes);
     *READY.lock().unwrap() = Some(Ready { version: version.clone(), update, package });
     Ok(Found::Ready(version))
+}
+
+/// macOS: true when this user can swap the app bundle without an admin password (write access
+/// to the bundle and to its folder). Otherwise the plugin would ask for one, which must not
+/// happen in a background check.
+#[cfg(target_os = "macos")]
+fn can_replace_in_place() -> bool {
+    use std::os::raw::{c_char, c_int};
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn access(path: *const c_char, mode: c_int) -> c_int;
+    }
+    const W_OK: c_int = 2;
+    let writable = |p: &std::path::Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes()).is_ok_and(|c| unsafe { access(c.as_ptr(), W_OK) } == 0)
+    };
+    // .../GSpot.app/Contents/MacOS/<binary>
+    let Ok(exe) = std::env::current_exe() else { return false };
+    match exe.ancestors().nth(3) {
+        Some(bundle) if bundle.extension().is_some_and(|e| e == "app") => writable(bundle) && bundle.parent().is_some_and(writable),
+        _ => false,
+    }
+}
+
+fn pending_install() -> bool {
+    READY.lock().unwrap().as_ref().is_some_and(|r| r.package.is_some())
 }
 
 fn ask_to_restart(app: &AppHandle, version: &str) {
@@ -174,6 +205,8 @@ fn ask_to_restart(app: &AppHandle, version: &str) {
     }
     let (message, yes) = if cfg!(windows) {
         (format!("{APP_NAME} {version} is ready. {APP_NAME} closes, installs it and opens again."), "Restart and Install")
+    } else if pending_install() {
+        (format!("{APP_NAME} {version} is ready. {APP_NAME} installs it and restarts. macOS may ask for an administrator password."), "Install and Restart")
     } else {
         (format!("{APP_NAME} {version} is installed. Restart {APP_NAME} to use it."), "Restart")
     };
@@ -194,27 +227,35 @@ fn ask_to_restart(app: &AppHandle, version: &str) {
         });
 }
 
-/// macOS: restart into the new bundle. Windows: run the verified installer, which exits the app.
+/// Installs a package that is not installed yet, then restarts into the new version.
+/// Windows: the installer closes and reopens the app, so this does not return on success.
 fn restart_into_update(app: &AppHandle) -> Result<(), String> {
-    #[cfg(windows)]
-    return run_installer(app);
-    #[cfg(not(windows))]
+    if pending_install() {
+        install_pending(app)?;
+    }
     app.restart();
 }
 
-/// Windows: runs the installer on the main thread (so the tray icon is removed first), then the
-/// process exits. Returns only when the installer could not be started.
-#[cfg(windows)]
-fn run_installer(app: &AppHandle) -> Result<(), String> {
+/// Installs the downloaded package. Windows: runs the installer on the main thread (so the tray
+/// icon is removed first); the process then exits, so this returns only on an error.
+fn install_pending(app: &AppHandle) -> Result<(), String> {
     let Some(Ready { update, package: Some(bytes), .. }) = READY.lock().unwrap().take() else {
         return Err("no update is ready".into());
     };
-    let (tx, rx) = std::sync::mpsc::channel();
-    app.run_on_main_thread(move || {
-        let _ = tx.send(update.install(&bytes).map_err(|e| e.to_string()));
-    })
-    .map_err(|e| e.to_string())?;
-    rx.recv().map_err(|e| e.to_string())?
+    #[cfg(windows)]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            let _ = tx.send(update.install(&bytes).map_err(|e| e.to_string()));
+        })
+        .map_err(|e| e.to_string())?;
+        rx.recv().map_err(|e| e.to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        update.install(&bytes).map_err(|e| e.to_string())
+    }
 }
 
 fn tell(app: &AppHandle, message: &str, error: bool) {
@@ -230,7 +271,8 @@ pub fn self_test_mode() -> Option<String> {
     std::env::var(SELF_TEST_ENV).ok().filter(|m| !m.is_empty())
 }
 
-/// Runs the self-test instead of the app: no window, no prompt, one JSON report, then exit.
+/// Runs the self-test instead of the app: no window and no prompt (except in `prompt` mode),
+/// one JSON report, then exit.
 pub fn run_self_test(app: &AppHandle, mode: String) {
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -243,6 +285,10 @@ pub fn run_self_test(app: &AppHandle, mode: String) {
             "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
             "endpoint_override": ENDPOINT_OVERRIDE.is_some(),
         });
+        #[cfg(target_os = "macos")]
+        {
+            report["in_place"] = can_replace_in_place().into();
+        }
         let code = match mode.as_str() {
             "version" => {
                 report["result"] = "version".into();
@@ -263,6 +309,21 @@ pub fn run_self_test(app: &AppHandle, mode: String) {
                     Err(e) => fail(&mut report, e.to_string()),
                 },
             },
+            "prompt" => match fetch(&app).await {
+                Ok(Found::Ready(version)) => {
+                    report["result"] = "asking".into();
+                    report["new_version"] = version.clone().into();
+                    report["install_waits_for_yes"] = pending_install().into();
+                    emit(&report);
+                    ask_to_restart(&app, &version);
+                    return;
+                }
+                Ok(Found::UpToDate(_)) => {
+                    report["result"] = "none".into();
+                    0
+                }
+                Err(e) => fail(&mut report, e),
+            },
             "install" => match fetch(&app).await {
                 Ok(Found::UpToDate(_)) => {
                     report["result"] = "none".into();
@@ -274,7 +335,7 @@ pub fn run_self_test(app: &AppHandle, mode: String) {
                 }
                 Err(e) => fail(&mut report, e),
             },
-            other => fail(&mut report, format!("unknown mode {other:?} (version, check, install)")),
+            other => fail(&mut report, format!("unknown mode {other:?} (version, check, install, prompt)")),
         };
         emit(&report);
         app.exit(code);
@@ -282,20 +343,19 @@ pub fn run_self_test(app: &AppHandle, mode: String) {
 }
 
 /// The "yes" branch of the prompt, without the prompt and without the restart.
-fn install_without_prompt(_app: &AppHandle, report: &mut Value) -> i32 {
-    #[cfg(windows)]
-    {
-        // Written first: on success the installer takes over and this process exits.
-        report["result"] = "installing".into();
-        emit(report);
-        let e = run_installer(_app).err().unwrap_or_default();
-        fail(report, e)
+fn install_without_prompt(app: &AppHandle, report: &mut Value) -> i32 {
+    if pending_install() {
+        if cfg!(windows) {
+            // Written first: on success the installer takes over and this process exits.
+            report["result"] = "installing".into();
+            emit(report);
+        }
+        if let Err(e) = install_pending(app) {
+            return fail(report, e);
+        }
     }
-    #[cfg(not(windows))]
-    {
-        report["result"] = "installed".into();
-        0
-    }
+    report["result"] = "installed".into();
+    0
 }
 
 fn fail(report: &mut Value, error: String) -> i32 {

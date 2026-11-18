@@ -29,6 +29,16 @@ plist() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist"; }
 cdhash() { codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'; }
 dr() { codesign -d -r- "$1" 2>&1 | sed -n 's/^designated => //p'; }
 leaf() { local d; d="$(mktemp -d)"; (cd "$d" && codesign -d --extract-certificates "$1" >/dev/null 2>&1 && shasum -a 256 codesign0 | cut -d' ' -f1); rm -rf "$d"; }
+# On-screen windows owned by a process (CGWindowList; no permission needed for owner and count).
+windows_of() {
+  cat > "$WORK/wins.swift" <<'EOF'
+import CoreGraphics
+let pid = Int32(CommandLine.arguments[1])!
+let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+print(list.filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid }.count)
+EOF
+  swift "$WORK/wins.swift" "$1" 2>/dev/null || echo 0
+}
 field() { python3 -c 'import json,sys; lines=[l for l in open(sys.argv[1]) if l.strip()]; d=json.loads(lines[-1]); print(d.get(sys.argv[2], ""))' "$1" "$2" 2>/dev/null || true; }
 
 # Runs the installed app's self-test. Sets RC (124 on a 180 s timeout).
@@ -151,6 +161,23 @@ check "[TCC] N+1 satisfies the requirement recorded for N" "" codesign --verify 
 check "[TCC] no leftover temp bundle next to the app" "" test -z "$(ls -d /Applications/*tauri* 2>/dev/null)"
 selftest check "$OUT/r-check-after.jsonl"
 check "[good] N+1 finds no newer version" "$(field "$OUT/r-check-after.jsonl" result)" test "$(field "$OUT/r-check-after.jsonl" result)" = none
+
+echo "==> The restart question, from N again (the background check as users get it)"
+rm -rf "$INSTALLED"; ditto "$WORK/N.app" "$INSTALLED"
+R="$OUT/r-prompt.jsonl"; rm -f "$R"
+PUBLIK_UPDATE_SELF_TEST=prompt PUBLIK_UPDATE_SELF_TEST_OUT="$R" "$BIN" > "$R.stdout" 2> "$R.log" &
+APP_PID=$!
+for _ in $(seq 1 120); do grep -q '"asking"' "$R" 2>/dev/null && break; kill -0 "$APP_PID" 2>/dev/null || break; sleep 1; done
+sleep 5
+ALIVE=no; kill -0 "$APP_PID" 2>/dev/null && ALIVE=yes
+check "[prompt] N asks to restart and keeps running (no forced restart)" "result=$(field "$R" result) running=$ALIVE version=$(field "$R" version)" \
+  test "$(field "$R" result)/$ALIVE/$(field "$R" version)" = "asking/yes/$N"
+check "[prompt] N+1 is already installed in the background" "$(plist "$INSTALLED" CFBundleShortVersionString), waits_for_yes=$(field "$R" install_waits_for_yes)" \
+  test "$(plist "$INSTALLED" CFBundleShortVersionString)" = "$N1"
+WINS="$(windows_of "$APP_PID")"
+check "[prompt] the question is on screen" "$WINS window(s) of the app" test "${WINS:-0}" -ge 1
+screencapture -x "$OUT/prompt-macos.png" 2>/dev/null || echo "screencapture unavailable"
+kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true
 
 security delete-keychain "$KC" 2>/dev/null || true
 rm -rf "$INSTALLED"
