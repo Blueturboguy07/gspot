@@ -8,7 +8,9 @@ before it installs anything.
 
 - The app reads `https://publikhq.com/api/updates/gspot/latest.json`. publik serves the
   `latest.json` asset of the scan-approved release tag, byte for byte. publik does not sign or
-  change it, so the release `latest.json` must be complete and correct.
+  change it, so the release `latest.json` must be complete and correct. The route answers 404
+  until a scan-approved release carries a `latest.json` asset. A 404 is silent in the background
+  check, and a manual check shows it as an error.
 - The app checks 10 s after launch and then once a day. "Check for Updates…" in the tray menu
   checks at once. `PUBLIK_NO_AUTO_UPDATE=1` turns off the automatic checks (the CI workflows set it).
 - macOS: the app downloads the new `GSpot.app`, verifies it, puts it in place of the old one,
