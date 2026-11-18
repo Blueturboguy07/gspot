@@ -1,6 +1,8 @@
 # Builds the unsigned macOS app for a publik release of GSpot.
 # The release Mac signs it with the Developer ID, notarizes it and makes the dmg
 # (the same steps as scripts/build-macos.sh). This workflow never creates a release.
+# It needs no update key: the updater bundle (.app.tar.gz + .sig) is packed from the final,
+# stapled app by scripts/sign-ci-macos.sh on the release Mac (docs/updates.md).
 name: publik-build
 
 on:
@@ -52,6 +54,8 @@ jobs:
 
       # No signing identity here: the app comes out unsigned (ad-hoc on Apple silicon).
       # The publik app token is compiled in (src/publik.rs, option_env!), as in scripts/build-macos.sh.
+      # No updater artifacts: an update bundle of this unsigned app must never ship (it would not
+      # carry the Developer ID identity), and tauri build would need the update key for them.
       - name: Build GSpot.app
         env:
           PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
@@ -61,7 +65,7 @@ jobs:
             exit 1
           fi
           cd src-tauri
-          ../ui/node_modules/.bin/tauri build --bundles app
+          ../ui/node_modules/.bin/tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Check and pack the app
         env:

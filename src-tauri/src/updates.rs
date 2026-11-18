@@ -1,0 +1,339 @@
+//! Signed self-update (tauri-plugin-updater). Written to be copied to another Tauri 2 app:
+//! change the values under "Per app" and follow the checklist in docs/updates.md.
+//!
+//! What it does
+//! - Checks the feed 10 s after launch, then once a day while the app runs. The day is measured
+//!   on the wall clock, so a Mac that slept through the day checks soon after it wakes.
+//!   `PUBLIK_NO_AUTO_UPDATE=1` turns the automatic checks off (CI, managed machines).
+//! - "Check for Updates…" in the tray menu runs the same check by hand.
+//! - Every package is checked against the public key in tauri.conf.json before it is used, and
+//!   its signature must name the version the feed announces (`requireSignedVersion`).
+//! - macOS: the new .app is downloaded, verified and swapped in place in the background. Then the
+//!   app asks to restart. Windows: the installer is downloaded and verified in the background.
+//!   Then the app asks, and "Restart and Install" runs the installer in passive mode (a progress
+//!   bar, no questions): it closes the app, updates it and opens it again. Nothing restarts
+//!   without a yes.
+//! - A background check that fails writes to the log only. A manual check shows the error.
+//!
+//! Build-time override: `PUBLIK_UPDATE_ENDPOINT` (one URL or a comma-separated list, read with
+//! `option_env!`) replaces the endpoints in tauri.conf.json, so a test build can use a test feed.
+//!
+//! Test hook: `PUBLIK_UPDATE_SELF_TEST=version|check|install` starts the app with no window and
+//! no prompt, runs the same check/download/verify/install code, writes one JSON line to stdout
+//! and appends it to the file named by `PUBLIK_UPDATE_SELF_TEST_OUT`, then exits.
+//! Exit codes: 0 = done (installed, up to date, or version), 2 = the update failed or was refused.
+
+use serde_json::{json, Value};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
+use tauri::{AppHandle, Runtime};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_updater::{Update, Updater, UpdaterExt};
+
+// ---- Per app ----------------------------------------------------------------------------------
+const APP_NAME: &str = "GSpot";
+const FIRST_CHECK_AFTER: Duration = Duration::from_secs(10);
+const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the background loop looks at the wall clock.
+const TICK: Duration = Duration::from_secs(30 * 60);
+// ------------------------------------------------------------------------------------------------
+
+const NO_AUTO_ENV: &str = "PUBLIK_NO_AUTO_UPDATE";
+const SELF_TEST_ENV: &str = "PUBLIK_UPDATE_SELF_TEST";
+const SELF_TEST_OUT_ENV: &str = "PUBLIK_UPDATE_SELF_TEST_OUT";
+/// Set at build time only. A running app never reads its endpoint from the environment.
+const ENDPOINT_OVERRIDE: Option<&str> = option_env!("PUBLIK_UPDATE_ENDPOINT");
+
+/// An update that is downloaded and verified, and on macOS already installed.
+struct Ready {
+    version: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    update: Update,
+    /// Windows: the verified installer, run on "Restart and Install". macOS: none (installed).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    package: Option<Vec<u8>>,
+}
+
+static READY: Mutex<Option<Ready>> = Mutex::new(None);
+static BUSY: AtomicBool = AtomicBool::new(false);
+static ASKING: AtomicBool = AtomicBool::new(false);
+
+enum Found {
+    UpToDate(String),
+    Ready(String),
+}
+
+/// The plugins the updater needs. Call on the Builder before `.setup`.
+pub fn plugins<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder.plugin(tauri_plugin_updater::Builder::new().build()).plugin(tauri_plugin_dialog::init())
+}
+
+/// Start the automatic checks: 10 s after launch, then once a day. Call from `setup`.
+pub fn start(app: &AppHandle) {
+    if std::env::var(NO_AUTO_ENV).is_ok_and(|v| !v.is_empty() && v != "0") {
+        log::info!("updates: automatic checks are off ({NO_AUTO_ENV})");
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FIRST_CHECK_AFTER).await;
+        let mut last: Option<SystemTime> = None;
+        loop {
+            // A clock that moved back gives an error here; that counts as due.
+            if last.map_or(true, |t| t.elapsed().map_or(true, |e| e >= CHECK_EVERY)) {
+                last = Some(SystemTime::now());
+                check(app.clone(), false).await;
+            }
+            tokio::time::sleep(TICK).await;
+        }
+    });
+}
+
+/// "Check for Updates…": the same check, with its result shown.
+pub fn check_now(app: &AppHandle) {
+    // An update that is already downloaded (the person chose "Later") is offered again at once.
+    let ready = READY.lock().unwrap().as_ref().map(|r| r.version.clone());
+    if let Some(version) = ready {
+        ask_to_restart(app, &version);
+        return;
+    }
+    tauri::async_runtime::spawn(check(app.clone(), true));
+}
+
+async fn check(app: AppHandle, manual: bool) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        if manual {
+            tell(&app, &format!("{APP_NAME} is already checking for updates."), false);
+        }
+        return;
+    }
+    let found = fetch(&app).await;
+    BUSY.store(false, Ordering::SeqCst);
+    match found {
+        Ok(Found::Ready(version)) => {
+            log::info!("updates: {APP_NAME} {version} is ready");
+            ask_to_restart(&app, &version);
+        }
+        Ok(Found::UpToDate(current)) => {
+            log::info!("updates: {current} is the latest version");
+            if manual {
+                tell(&app, &format!("{APP_NAME} {current} is the latest version."), false);
+            }
+        }
+        Err(e) => {
+            log::warn!("updates: the check failed: {e}");
+            if manual {
+                tell(&app, &format!("{APP_NAME} could not check for updates.\n\n{e}"), true);
+            }
+        }
+    }
+}
+
+/// The updater, with the build-time endpoint override applied.
+fn updater(app: &AppHandle) -> Result<Updater, String> {
+    let mut builder = app.updater_builder();
+    if let Some(list) = ENDPOINT_OVERRIDE.map(str::trim).filter(|s| !s.is_empty()) {
+        let urls = list
+            .split(',')
+            .map(|u| url::Url::parse(u.trim()).map_err(|e| format!("PUBLIK_UPDATE_ENDPOINT {u}: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        builder = builder.endpoints(urls).map_err(|e| e.to_string())?;
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// Check, download and verify; on macOS also install. The one code path behind the automatic
+/// check, the menu item and the self-test.
+async fn fetch(app: &AppHandle) -> Result<Found, String> {
+    let Some(update) = updater(app)?.check().await.map_err(|e| e.to_string())? else {
+        return Ok(Found::UpToDate(app.package_info().version.to_string()));
+    };
+    let version = update.version.clone();
+    if READY.lock().unwrap().as_ref().is_some_and(|r| r.version == version) {
+        return Ok(Found::Ready(version));
+    }
+    // `download` verifies the signature (and the signed version) before it returns the bytes.
+    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    let package = Some(bytes);
+    #[cfg(not(windows))]
+    let package = {
+        // Verifies again, then swaps the new bundle in place. The running app is not touched.
+        update.install(&bytes).map_err(|e| e.to_string())?;
+        None
+    };
+    *READY.lock().unwrap() = Some(Ready { version: version.clone(), update, package });
+    Ok(Found::Ready(version))
+}
+
+fn ask_to_restart(app: &AppHandle, version: &str) {
+    if ASKING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (message, yes) = if cfg!(windows) {
+        (format!("{APP_NAME} {version} is ready. {APP_NAME} closes, installs it and opens again."), "Restart and Install")
+    } else {
+        (format!("{APP_NAME} {version} is installed. Restart {APP_NAME} to use it."), "Restart")
+    };
+    let handle = app.clone();
+    app.dialog()
+        .message(message)
+        .title(format!("{APP_NAME} update"))
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom(yes.into(), "Later".into()))
+        .show(move |restart| {
+            ASKING.store(false, Ordering::SeqCst);
+            if restart {
+                if let Err(e) = restart_into_update(&handle) {
+                    log::error!("updates: {e}");
+                    tell(&handle, &format!("{APP_NAME} could not install the update.\n\n{e}"), true);
+                }
+            }
+        });
+}
+
+/// macOS: restart into the new bundle. Windows: run the verified installer, which exits the app.
+fn restart_into_update(app: &AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    return run_installer(app);
+    #[cfg(not(windows))]
+    app.restart();
+}
+
+/// Windows: runs the installer on the main thread (so the tray icon is removed first), then the
+/// process exits. Returns only when the installer could not be started.
+#[cfg(windows)]
+fn run_installer(app: &AppHandle) -> Result<(), String> {
+    let Some(Ready { update, package: Some(bytes), .. }) = READY.lock().unwrap().take() else {
+        return Err("no update is ready".into());
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(update.install(&bytes).map_err(|e| e.to_string()));
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|e| e.to_string())?
+}
+
+fn tell(app: &AppHandle, message: &str, error: bool) {
+    app.dialog()
+        .message(message)
+        .title(format!("{APP_NAME} update"))
+        .kind(if error { MessageDialogKind::Error } else { MessageDialogKind::Info })
+        .show(|_| {});
+}
+
+/// The self-test mode, when `PUBLIK_UPDATE_SELF_TEST` is set.
+pub fn self_test_mode() -> Option<String> {
+    std::env::var(SELF_TEST_ENV).ok().filter(|m| !m.is_empty())
+}
+
+/// Runs the self-test instead of the app: no window, no prompt, one JSON report, then exit.
+pub fn run_self_test(app: &AppHandle, mode: String) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut report = json!({
+            "self_test": mode,
+            "version": app.package_info().version.to_string(),
+            "pid": std::process::id(),
+            "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+            "endpoint_override": ENDPOINT_OVERRIDE.is_some(),
+        });
+        let code = match mode.as_str() {
+            "version" => {
+                report["result"] = "version".into();
+                0
+            }
+            "check" => match updater(&app) {
+                Err(e) => fail(&mut report, e),
+                Ok(u) => match u.check().await {
+                    Ok(Some(update)) => {
+                        report["result"] = "available".into();
+                        report["new_version"] = update.version.into();
+                        0
+                    }
+                    Ok(None) => {
+                        report["result"] = "none".into();
+                        0
+                    }
+                    Err(e) => fail(&mut report, e.to_string()),
+                },
+            },
+            "install" => match fetch(&app).await {
+                Ok(Found::UpToDate(_)) => {
+                    report["result"] = "none".into();
+                    0
+                }
+                Ok(Found::Ready(version)) => {
+                    report["new_version"] = version.into();
+                    install_without_prompt(&app, &mut report)
+                }
+                Err(e) => fail(&mut report, e),
+            },
+            other => fail(&mut report, format!("unknown mode {other:?} (version, check, install)")),
+        };
+        emit(&report);
+        app.exit(code);
+    });
+}
+
+/// The "yes" branch of the prompt, without the prompt and without the restart.
+fn install_without_prompt(_app: &AppHandle, report: &mut Value) -> i32 {
+    #[cfg(windows)]
+    {
+        // Written first: on success the installer takes over and this process exits.
+        report["result"] = "installing".into();
+        emit(report);
+        let e = run_installer(_app).err().unwrap_or_default();
+        fail(report, e)
+    }
+    #[cfg(not(windows))]
+    {
+        report["result"] = "installed".into();
+        0
+    }
+}
+
+fn fail(report: &mut Value, error: String) -> i32 {
+    report["result"] = "error".into();
+    report["error"] = error.into();
+    2
+}
+
+fn emit(report: &Value) {
+    let line = report.to_string();
+    let _ = writeln!(std::io::stdout(), "{line}");
+    if let Some(path) = std::env::var_os(SELF_TEST_OUT_ENV) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    /// The shipped config: the real feed over https, the key, the strict checks. Test builds
+    /// change these with `--config` and PUBLIK_UPDATE_ENDPOINT, never in tauri.conf.json.
+    #[test]
+    fn the_shipped_config_points_at_the_publik_feed_with_strict_checks() {
+        let conf: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let updater = &conf["plugins"]["updater"];
+        let endpoints = updater["endpoints"].as_array().unwrap();
+        assert!(!endpoints.is_empty());
+        for e in endpoints {
+            assert!(e.as_str().unwrap().starts_with("https://publikhq.com/api/updates/"), "{e}");
+        }
+        assert_eq!(updater["requireSignedVersion"], true);
+        assert!(updater.get("dangerousInsecureTransportProtocol").is_none());
+        assert!(updater.get("allowDowngrades").is_none());
+        assert_eq!(conf["bundle"]["createUpdaterArtifacts"], true);
+        // base64 of "untrusted comment: minisign public key:", as `tauri signer generate` writes it.
+        assert!(updater["pubkey"].as_str().unwrap().starts_with("dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6"));
+    }
+}

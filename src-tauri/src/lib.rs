@@ -20,6 +20,7 @@ pub mod score;
 pub mod settings;
 pub mod textmap;
 pub mod uia;
+pub mod updates;
 
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
@@ -39,11 +40,19 @@ pub fn run() {
     state.history = history::load();
     let shared: host::Shared = Arc::new(Mutex::new(state));
     let dock_side = shared.lock().unwrap().settings.dock_side.clone();
+    // Updater test hook (PUBLIK_UPDATE_SELF_TEST): no window, no gate; see updates.rs.
+    let update_self_test = updates::self_test_mode();
 
-    tauri::Builder::default()
+    updates::plugins(tauri::Builder::default())
         .manage(shared.clone())
         .register_uri_scheme_protocol(publik_gate::SCHEME, publik_gate::protocol)
         .setup(move |app| {
+            if let Some(mode) = update_self_test {
+                updates::run_self_test(app.handle(), mode);
+                return Ok(());
+            }
+            // Update checks start at launch, before the gate, so a gate bug can be fixed by an update.
+            updates::start(app.handle());
             // Sign in with publik comes first: the gate window is the only window until the
             // person is signed in. Then start_app builds the overlay windows and the tray.
             #[cfg(target_os = "macos")]
@@ -118,9 +127,11 @@ fn start_app(app: &AppHandle, shared: &host::Shared, dock_side: &str, choice: Op
 
     let open = MenuItem::with_id(app, "open", "Open GSpot", true, None::<&str>)?;
     let perms = MenuItem::with_id(app, "perms", "Accessibility permission…", true, None::<&str>)?;
+    // GSpot has no app menu (a menu-bar app on macOS, a tray app on Windows): the update item is here.
+    let updates_item = MenuItem::with_id(app, "updates", "Check for Updates…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit GSpot", true, None::<&str>)?;
     // Windows needs no screen-reading permission, so its tray menu has no such item.
-    let menu = if platform::NEEDS_PERMISSION { Menu::with_items(app, &[&open, &perms, &quit])? } else { Menu::with_items(app, &[&open, &quit])? };
+    let menu = if platform::NEEDS_PERMISSION { Menu::with_items(app, &[&open, &perms, &updates_item, &quit])? } else { Menu::with_items(app, &[&open, &updates_item, &quit])? };
     let mut tray = TrayIconBuilder::with_id("main").menu(&menu).show_menu_on_left_click(true).tooltip("GSpot");
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
@@ -130,6 +141,7 @@ fn start_app(app: &AppHandle, shared: &host::Shared, dock_side: &str, choice: Op
         "perms" => {
             platform::prompt_trust();
         }
+        "updates" => updates::check_now(app),
         "quit" => app.exit(0),
         _ => {}
     })

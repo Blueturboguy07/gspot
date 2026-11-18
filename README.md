@@ -68,6 +68,10 @@ GSpot lives in the menu bar (macOS) or the notification area (Windows), and as a
 screen edge. The first start shows "Sign in with publik". After sign-in you choose publik API or
 your own key.
 
+GSpot updates itself. It checks at start and once a day, downloads and verifies a signed update,
+and asks before it restarts. The tray menu has "Check for Updates…". See [docs/updates.md](docs/updates.md)
+(releases, key, roll back).
+
 ## Usage counts
 
 GSpot sends two usage events to publik: `app_opened` at start, and `active_session` every 30 minutes

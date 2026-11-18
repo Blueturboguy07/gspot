@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Updates.
+
+- GSpot updates itself. It checks at start and once a day. "Check for Updates…" in the tray menu checks at once.
+- Every update is signed. GSpot checks the signature and the version before it installs anything.
+- macOS: GSpot installs the update in the background and asks to restart. Windows: GSpot downloads the update and asks; the installer then runs with a progress bar only and opens GSpot again.
+- `PUBLIK_NO_AUTO_UPDATE=1` turns off the automatic checks. See `docs/updates.md`.
+
 ## 0.2.1 (2026-11-10)
 
 Sign in with publik.

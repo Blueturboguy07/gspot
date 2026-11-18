@@ -1,0 +1,239 @@
+# Proves the signed self-updater end to end on clean GitHub runners. Never run on a desk Mac.
+#
+# Builds GSpot N (0.0.1) and N+1 (0.0.2) with the release commands, compiled to read their
+# update feed from http://127.0.0.1:$FEED_PORT/latest.json (PUBLIK_UPDATE_ENDPOINT at build time;
+# plain HTTP on loopback needs dangerousInsecureTransportProtocol, set for these test builds only).
+# Then, on macos-latest and windows-latest: install N, serve the feed in the job, and run N's
+# updater self-test (PUBLIK_UPDATE_SELF_TEST, src-tauri/src/updates.rs) against
+#   - a feed whose signature is from another key        -> refused, N stays on disk
+#   - a feed whose package has one byte changed          -> refused, N stays on disk
+#   - a feed that announces a version the signature does not name -> refused, N stays on disk
+#   - the good feed                                      -> N+1 installed, the app on disk reports N+1
+# macOS also checks that the updated app keeps the bundle id, the signing certificate and the
+# designated requirement (what TCC permissions are bound to). The runner has no Developer ID, so
+# both macOS builds are signed with one throwaway certificate (see tests/updater/proof-macos.sh).
+# Nothing is published: no release, no tag. Results: the job summaries and the updater-proof-* artifacts.
+name: updater-proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: updater-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DO_NOT_TRACK: '1'
+  PUBLIK_NO_AUTO_UPDATE: '1'
+  FEED_PORT: '47390'
+  N: '0.0.1'
+  N1: '0.0.2'
+
+jobs:
+  build-macos:
+    name: Build macOS ${{ matrix.version }}
+    strategy:
+      matrix:
+        version: ['0.0.1', '0.0.2']
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain of publik-build.yml.
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.2.app
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: pnpm
+        run: npm install -g pnpm@12.8.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: updater-proof
+          cache-on-failure: true
+
+      - name: Install the UI packages
+        run: pnpm --dir ui install --frozen-lockfile
+
+      # The publik-build.yml command (no updater artifacts: the release packs the update bundle
+      # after Developer ID signing), plus the test version and the loopback feed.
+      - name: Build GSpot.app ${{ matrix.version }}
+        env:
+          PUBLIK_UPDATE_ENDPOINT: http://127.0.0.1:${{ env.FEED_PORT }}/latest.json
+          VERSION: ${{ matrix.version }}
+        run: |
+          printf '{"version":"%s","bundle":{"createUpdaterArtifacts":false},"plugins":{"updater":{"dangerousInsecureTransportProtocol":true}}}' "$VERSION" > "$RUNNER_TEMP/proof.conf.json"
+          cd src-tauri
+          ../ui/node_modules/.bin/tauri build --bundles app --config "$RUNNER_TEMP/proof.conf.json"
+          cd ..
+          APP=src-tauri/target/release/bundle/macos/GSpot.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$VERSION"
+          lipo -archs "$APP/Contents/MacOS/grammarlama"
+          grep -q -a -F "127.0.0.1:$FEED_PORT/latest.json" "$APP/Contents/MacOS/grammarlama"
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" "dist/GSpot-$VERSION.app.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-macos-${{ matrix.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  build-windows:
+    name: Build Windows ${{ matrix.version }}
+    strategy:
+      matrix:
+        version: ['0.0.1', '0.0.2']
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain of windows.yml.
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: pnpm
+        run: npm install -g pnpm@12.8.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: updater-proof
+          cache-on-failure: true
+
+      - name: Install the UI packages
+        run: pnpm --dir ui install --frozen-lockfile
+
+      # The windows.yml command with the update key: tauri build writes the installer and its .sig.
+      - name: Build the installer ${{ matrix.version }}
+        working-directory: src-tauri
+        shell: pwsh
+        env:
+          PUBLIK_UPDATE_ENDPOINT: http://127.0.0.1:${{ env.FEED_PORT }}/latest.json
+          VERSION: ${{ matrix.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { Write-Error "The TAURI_SIGNING_PRIVATE_KEY secret is not set."; exit 1 }
+          $cfg = Join-Path $env:RUNNER_TEMP "proof.conf.json"
+          '{"version":"' + $env:VERSION + '","plugins":{"updater":{"dangerousInsecureTransportProtocol":true}}}' | Set-Content $cfg -Encoding ascii
+          & ..\ui\node_modules\.bin\tauri.cmd build --bundles nsis --config $cfg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ..\dist | Out-Null
+          Copy-Item "target/release/bundle/nsis/GSpot_$($env:VERSION)_x64-setup.exe", "target/release/bundle/nsis/GSpot_$($env:VERSION)_x64-setup.exe.sig" ..\dist\
+          Get-ChildItem ..\dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-windows-${{ matrix.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  proof-macos:
+    name: Proof on macos-latest
+    needs: build-macos
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # For the Tauri CLI (tauri signer): the release pack script signs with it.
+      - name: Install the UI packages
+        run: |
+          npm install -g pnpm@12.8.1
+          pnpm --dir ui install --frozen-lockfile
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-macos-*
+          path: builds
+          merge-multiple: true
+
+      - name: Unpack N and N+1
+        run: |
+          uname -m; sw_vers
+          mkdir -p apps/N apps/N1
+          ditto -x -k "builds/GSpot-$N.app.zip" apps/N
+          ditto -x -k "builds/GSpot-$N1.app.zip" apps/N1
+
+      - name: Prove the updater
+        timeout-minutes: 20
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash tests/updater/proof-macos.sh apps/N/GSpot.app apps/N1/GSpot.app out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: updater-proof-macos
+          path: out/
+          retention-days: 30
+
+  proof-windows:
+    name: Proof on windows-latest
+    needs: build-windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # For the Tauri CLI (tauri signer), which makes the foreign-key signature.
+      - name: Install the UI packages
+        run: |
+          npm install -g pnpm@12.8.1
+          pnpm --dir ui install --frozen-lockfile
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-windows-*
+          path: builds
+          merge-multiple: true
+
+      - name: Prove the updater
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          $n = (Get-Item "builds/GSpot_$($env:N)_x64-setup.exe").FullName
+          $n1 = (Get-Item "builds/GSpot_$($env:N1)_x64-setup.exe").FullName
+          pwsh -NoProfile -File tests/updater/proof-windows.ps1 -N $n -N1 $n1 -Out out
+          exit $LASTEXITCODE
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: updater-proof-windows
+          path: out/
+          retention-days: 30

@@ -5,8 +5,12 @@
 #
 # Usage: scripts/sign-ci-macos.sh <GSpot-unsigned-aarch64.app.zip> <out dir>
 # Env:   NOTARY_PROFILE (notarytool keychain profile, default "publik"),
-#        APPLE_SIGNING_IDENTITY (default: the Developer ID below).
-# Out:   <out dir>/GSpot_<version>_aarch64.dmg (signed, notarized, stapled; the app inside too).
+#        APPLE_SIGNING_IDENTITY (default: the Developer ID below),
+#        TAURI_SIGNING_PRIVATE_KEY(+_PASSWORD) or the "publik-update-key" keychain item
+#        (scripts/updater-pack-macos.sh; SKIP_UPDATER=1 skips the update bundle).
+# Out:   <out dir>/GSpot_<version>_aarch64.dmg (signed, notarized, stapled; the app inside too),
+#        <out dir>/GSpot_<version>_aarch64.app.tar.gz + .sig (the same stapled app, for the updater;
+#        see docs/updates.md).
 set -euo pipefail
 ZIP="${1:?unsigned app zip}"
 OUT="${2:?out dir}"
@@ -37,6 +41,12 @@ echo "==> Notarizing the app"
 ditto -c -k --keepParent "$APP" "$WORK/GSpot.zip"
 notarize "$WORK/GSpot.zip"
 xcrun stapler staple "$APP"
+
+# The update bundle is the stapled app itself, so an update keeps the Developer ID identity.
+if [ "${SKIP_UPDATER:-0}" != 1 ]; then
+  echo "==> Update bundle"
+  "$ROOT/scripts/updater-pack-macos.sh" "$APP" "$OUT"
+fi
 
 echo "==> Building the dmg"
 STAGE="$WORK/stage"

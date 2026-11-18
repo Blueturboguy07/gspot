@@ -1,4 +1,5 @@
-# Builds the GSpot Windows installer (NSIS, x64, unsigned) and tests it on clean
+# Builds the GSpot Windows installer (NSIS, x64, not code-signed) and its updater signature
+# (<installer>.sig, made with the TAURI_SIGNING_PRIVATE_KEY secret; docs/updates.md), and tests it on clean
 # Windows runners: install, start, connect to Notepad / WordPad / an Edge text area,
 # underline, hover, accept, panel, terminal skip, uninstall. Screenshots, a desktop
 # recording and the results table are uploaded as the "e2e-<os>" artifacts.
@@ -25,6 +26,8 @@ concurrency:
 env:
   # publik usage counts stay off on CI (the e2e launches the app).
   DO_NOT_TRACK: '1'
+  # No automatic update check while the e2e drives the app (src-tauri/src/updates.rs).
+  PUBLIK_NO_AUTO_UPDATE: '1'
 
 jobs:
   build:
@@ -70,13 +73,17 @@ jobs:
         run: cargo test --locked
 
       # The publik app token is compiled in (src/publik.rs, option_env!), as on macOS.
+      # With the update key, tauri build also writes <installer>.sig (createUpdaterArtifacts).
       - name: Build the installer
         working-directory: src-tauri
         shell: pwsh
         env:
           PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if (-not $env:PUBLIK_APP_TOKEN) { Write-Error "The PUBLIK_APP_TOKEN secret is not set. The build would have no publik API."; exit 1 }
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { Write-Error "The TAURI_SIGNING_PRIVATE_KEY secret is not set. The installer would have no updater signature."; exit 1 }
           & ..\ui\node_modules\.bin\tauri.cmd build --bundles nsis
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -96,8 +103,14 @@ jobs:
           if (-not $text.Contains($env:PUBLIK_APP_TOKEN)) { Write-Error "The publik app token is not in the binary."; exit 1 }
           if (-not $text.Contains("publik-telemetry")) { Write-Error "The telemetry client is not in the binary."; exit 1 }
           if (git status --porcelain -- src-tauri/Cargo.lock) { Write-Warning "Cargo.lock changed during the build."; git diff -- src-tauri/Cargo.lock | Select-Object -First 80 }
+          # The updater signature must verify against the pubkey in tauri.conf.json and name this version.
+          $sig = "$($exe.FullName).sig"
+          if (-not (Test-Path $sig)) { Write-Error "no updater signature next to the installer"; exit 1 }
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          node scripts/updater-latest-json.mjs --version $version --base-url "https://github.com/${{ github.repository }}/releases/download/v$version/" --platform "windows-x86_64=$($exe.FullName)" --out "$env:RUNNER_TEMP/latest-check.json"
+          if ($LASTEXITCODE -ne 0) { Write-Error "the updater signature does not verify"; exit 1 }
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item $exe.FullName dist/
+          Copy-Item $exe.FullName, $sig dist/
           Get-FileHash dist/*.exe -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } | Tee-Object dist/SHA256SUMS-windows.txt
 
       - uses: actions/upload-artifact@v4

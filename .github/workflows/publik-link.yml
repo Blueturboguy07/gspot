@@ -21,6 +21,8 @@ permissions:
 
 env:
   DO_NOT_TRACK: '1'
+  # No automatic update check while the e2e drives the app (src-tauri/src/updates.rs).
+  PUBLIK_NO_AUTO_UPDATE: '1'
 
 jobs:
   link:

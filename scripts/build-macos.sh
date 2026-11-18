@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build GSpot.app signed with the Developer ID identity (hardened runtime).
 # Notarization runs when NOTARY_PROFILE or APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID are set.
+# A notarized build also gets the updater bundle (scripts/updater-pack-macos.sh, docs/updates.md).
 # Usage: scripts/build-macos.sh [--skip-notarize]
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -29,7 +30,8 @@ if [ -z "${PUBLIK_APP_TOKEN:-}" ] && [ -s "$HOME/.publik/gspot-app-token" ]; the
 fi
 if [ -z "${PUBLIK_APP_TOKEN:-}" ]; then echo "==> No PUBLIK_APP_TOKEN: this build cannot offer publik API (own key and local models still work)." >&2; else echo "==> publik app token present (compiled in)."; fi
 echo "==> Building with identity: $IDENTITY"
-cd "$ROOT/src-tauri" && "$TAURI" build
+# The update bundle is packed after notarization (below), from the stapled app.
+cd "$ROOT/src-tauri" && "$TAURI" build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 APP="$ROOT/src-tauri/target/release/bundle/macos/GSpot.app"
 DMG="$(/usr/bin/find "$ROOT/src-tauri/target/release/bundle/dmg" -name "*.dmg" -print -quit 2>/dev/null || true)"
 [ -d "$APP" ] || { echo "No GSpot.app produced" >&2; exit 1; }
@@ -44,5 +46,8 @@ if [ "$NOTARIZE" = 1 ]; then
     codesign --force --sign "$IDENTITY" --timestamp "$DMG"
     xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait; xcrun stapler staple "$DMG"
   fi
+  "$ROOT/scripts/updater-pack-macos.sh" "$APP" "$ROOT/src-tauri/target/release/bundle/updater"
+else
+  echo "==> Not notarized: no update bundle (it is made only from a notarized app)." >&2
 fi
 echo; echo "App: $APP"; [ -n "$DMG" ] && echo "Dmg: $DMG"; echo "Now run: scripts/verify-macos.sh"
