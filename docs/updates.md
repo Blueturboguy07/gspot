@@ -7,11 +7,14 @@ before it installs anything.
 ## How it works
 
 - The app reads `https://publikhq.com/api/updates/gspot/latest.json`. publik serves the
-  `latest.json` asset of the release that passed its scan.
+  `latest.json` asset of the scan-approved release tag, byte for byte. publik does not sign or
+  change it, so the release `latest.json` must be complete and correct.
 - The app checks 10 s after launch and then once a day. "Check for Updates…" in the tray menu
   checks at once. `PUBLIK_NO_AUTO_UPDATE=1` turns off the automatic checks (the CI workflows set it).
 - macOS: the app downloads the new `GSpot.app`, verifies it, puts it in place of the old one,
-  and asks "Restart" or "Later".
+  and asks "Restart" or "Later". If the user cannot write to the app's folder, the app does not
+  replace it in the background. It asks "Install and Restart" or "Later", and macOS asks for an
+  admin password only after "Install and Restart".
 - Windows: the app downloads the installer, verifies it, and asks "Restart and Install" or
   "Later". The installer runs with a progress bar only, then opens GSpot again.
 - The signature must also name the version that `latest.json` announces
@@ -103,8 +106,12 @@ The public key is compiled into each copy, so a new key reaches users only throu
 
 Run `updater-proof.yml` (workflow_dispatch). It builds 0.0.1 and 0.0.2, installs 0.0.1 on
 `macos-latest` and `windows-latest`, and checks that 0.0.1 refuses three bad feeds and then
-updates to 0.0.2. The app has a test hook for this: `PUBLIK_UPDATE_SELF_TEST=version|check|install`
-runs the updater with no window and no prompt and prints one JSON line.
+updates to 0.0.2. Then it starts 0.0.1 once more and checks that the restart question is on
+screen while the app keeps running. A push to `feat/updater` or `updater/**` also starts it.
+
+The app has a test hook for this: `PUBLIK_UPDATE_SELF_TEST=version|check|install` runs the
+updater with no window and no prompt and prints one JSON line. `prompt` runs the background
+path and shows the real question. The hook does not click the buttons.
 
 ## Copy to another Tauri 2 app
 
