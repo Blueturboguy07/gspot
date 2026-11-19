@@ -75,9 +75,29 @@ for t in gh git node npm xcrun codesign hdiutil security shasum spctl ditto tar 
   command -v "$t" >/dev/null || die "$t is not installed"
 done
 gh auth status >/dev/null 2>&1 || die "gh is not logged in"
-REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
-BASE_URL="https://github.com/$REPO/releases/download/$TAG/"
 mkdir -p "$WORK"
+# gh for reads and downloads, with retries: the GitHub API limit (5000 calls an hour) is per user
+# and other jobs of the same user share it; a 5xx or a dropped connection is retried too.
+ghr() {
+  local out err i
+  for i in $(seq 1 45); do
+    if out="$(gh "$@" 2> "$WORK/gh.err")"; then
+      [ -z "$out" ] || printf '%s\n' "$out"
+      return 0
+    fi
+    err="$(tr '\n' ' ' < "$WORK/gh.err")"
+    case "$err" in
+      *"rate limit"* | *"HTTP 5"* | *"timed out"* | *"timeout"* | *"connection"* | *"EOF"* | *"TLS"*) ;;
+      *) printf '%s\n' "$err" >&2; return 1 ;;
+    esac
+    echo "    GitHub API: ${err:0:110}... waiting 60 s (try $i of 45)" >&2
+    sleep 60
+  done
+  printf '%s\n' "$err" >&2
+  return 1
+}
+REPO="$(ghr repo view --json nameWithOwner -q .nameWithOwner)"
+BASE_URL="https://github.com/$REPO/releases/download/$TAG/"
 STATE="$WORK/state"
 touch "$STATE"
 get_state() { sed -n "s/^$1=//p" "$STATE" | tail -1; }
@@ -85,12 +105,12 @@ set_state() { echo "$1=$2" >> "$STATE"; }
 
 # ---------------------------------------------------------------------------------------------
 say "$APP $V: checks"
-RELEASE="$(gh release view "$TAG" -R "$REPO" --json isDraft,targetCommitish 2>/dev/null || true)"
+RELEASE="$(ghr release view "$TAG" -R "$REPO" --json isDraft,targetCommitish 2>/dev/null || true)"
 if [ -z "$RELEASE" ]; then RSTATE=none
 elif [ "$(node -p 'JSON.parse(process.argv[1]).isDraft' "$RELEASE")" = true ]; then RSTATE=draft
 else RSTATE=published; fi
 ok "release $TAG: $RSTATE"
-PREV_TAG="$(gh release list -R "$REPO" --exclude-drafts --exclude-pre-releases -L 20 --json tagName -q '.[].tagName' | grep -vx "$TAG" | head -1)"
+PREV_TAG="$(ghr release list -R "$REPO" --exclude-drafts --exclude-pre-releases -L 20 --json tagName -q '.[].tagName' | grep -vx "$TAG" | head -1)"
 [ -n "$PREV_TAG" ] || die "no earlier published release"
 ok "last published release: $PREV_TAG"
 git fetch -q origin "$BRANCH" --tags
@@ -162,21 +182,21 @@ with_update_key() {
 }
 
 # ---------------------------------------------------------------------------------------------
-run_field() { gh run view "$1" -R "$REPO" --json "$2" -q ".$2"; }
+run_field() { ghr run view "$1" -R "$REPO" --json "$2" -q ".$2"; }
 # The newest workflow_dispatch run of a workflow on $SHA, or nothing.
 last_run() {
-  gh run list -R "$REPO" --workflow "$1" --commit "$SHA" --event workflow_dispatch -L 20 \
+  ghr run list -R "$REPO" --workflow "$1" --commit "$SHA" --event workflow_dispatch -L 20 \
     --json databaseId,createdAt -q 'sort_by(.createdAt) | reverse | .[0].databaseId // empty'
 }
 # Starts a workflow on $BRANCH (the extra arguments are -f inputs) and prints the new run's id.
 start_run() {
   local wf="$1" before id
   shift
-  before="$(gh run list -R "$REPO" --workflow "$wf" -L 50 --json databaseId -q '.[].databaseId' | sort)"
+  before="$(ghr run list -R "$REPO" --workflow "$wf" -L 50 --json databaseId -q '.[].databaseId' | sort)"
   gh workflow run "$wf" -R "$REPO" --ref "$BRANCH" "$@" >/dev/null
   for _ in $(seq 1 40); do
     sleep 5
-    id="$(gh run list -R "$REPO" --workflow "$wf" --commit "$SHA" --event workflow_dispatch -L 20 --json databaseId -q '.[].databaseId' |
+    id="$(ghr run list -R "$REPO" --workflow "$wf" --commit "$SHA" --event workflow_dispatch -L 20 --json databaseId -q '.[].databaseId' |
       sort | comm -13 <(printf '%s\n' "$before") - | tail -1)"
     [ -n "$id" ] && { echo "$id"; return; }
   done
@@ -195,7 +215,7 @@ wait_run() {
 # windows.yml may re-run its failed jobs once when its build job passed (the Edge e2e is flaky).
 can_rerun() {
   [ "$1" = windows.yml ] && [ "$(get_state "rerun_$2")" != "done" ] &&
-    [ "$(gh run view "$2" -R "$REPO" --json jobs -q '.jobs[] | select(.name == "Build the Windows installer") | .conclusion')" = success ]
+    [ "$(ghr run view "$2" -R "$REPO" --json jobs -q '.jobs[] | select(.name == "Build the Windows installer") | .conclusion')" = success ]
 }
 rerun_failed() {
   echo "    $1 run $2: a test job failed; re-running the failed jobs once" >&2
@@ -234,7 +254,7 @@ OUT="$WORK/out"
 mkdir -p "$IN" "$OUT"
 have_all_assets() {
   local names
-  names="$(gh release view "$TAG" -R "$REPO" --json assets -q '.assets[] | select(.state == "uploaded") | .name' 2>/dev/null | sort)"
+  names="$(ghr release view "$TAG" -R "$REPO" --json assets -q '.assets[] | select(.state == "uploaded") | .name' 2>/dev/null | sort)"
   [ "$names" = "$(printf '%s\n' "${ASSETS[@]}" | sort)" ]
 }
 
@@ -253,11 +273,11 @@ if [ "$RSTATE" != published ]; then
     note "the draft has every file and the work folder has none: verifying the draft"
   else
     say "Download the CI builds"
-    [ -f "$OUT/SHA256SUMS-windows.txt" ] || gh run download "$WIN_RUN" -R "$REPO" -n GSpot-windows-x64 -D "$OUT"
+    [ -f "$OUT/SHA256SUMS-windows.txt" ] || ghr run download "$WIN_RUN" -R "$REPO" -n GSpot-windows-x64 -D "$OUT"
     (cd "$OUT" && shasum -a 256 -c SHA256SUMS-windows.txt >/dev/null) || die "the Windows installer does not match the CI checksum"
     [ -f "$OUT/$EXE" ] && [ -f "$OUT/$EXE.sig" ] || die "the windows.yml artifact has no $EXE and $EXE.sig"
     ok "$EXE and its .sig (checksum as built by CI)"
-    [ -f "$IN/GSpot-unsigned-aarch64.app.zip" ] || gh run download "$MAC_RUN" -R "$REPO" -n GSpot-macos-arm64-unsigned -D "$IN"
+    [ -f "$IN/GSpot-unsigned-aarch64.app.zip" ] || ghr run download "$MAC_RUN" -R "$REPO" -n GSpot-macos-arm64-unsigned -D "$IN"
     unzip -p "$IN/GSpot-unsigned-aarch64.app.zip" GSpot.app/Contents/Info.plist > "$IN/Info.plist"
     [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$IN/Info.plist")" = "$V" ] || die "the CI app is not version $V"
     ok "GSpot-unsigned-aarch64.app.zip (version $V)"
@@ -313,7 +333,7 @@ if [ "$RSTATE" != published ]; then
       RSTATE=draft
       ok "draft created with ${#ASSETS[@]} files"
     else
-      DIGESTS="$(gh release view "$TAG" -R "$REPO" --json assets -q '.assets[] | "\(.name) \(.digest)"')"
+      DIGESTS="$(ghr release view "$TAG" -R "$REPO" --json assets -q '.assets[] | "\(.name) \(.digest)"')"
       for a in "${ASSETS[@]}"; do
         if printf '%s\n' "$DIGESTS" | grep -qxF "$a sha256:$(sha "$OUT/$a")"; then continue; fi
         gh release upload "$TAG" -R "$REPO" --clobber "$OUT/$a" >/dev/null
@@ -325,7 +345,7 @@ if [ "$RSTATE" != published ]; then
   fi
 
   say "mac-smoke.yml on the draft"
-  DMG_DIGEST="$(gh release view "$TAG" -R "$REPO" --json assets -q ".assets[] | select(.name == \"$DMG\") | .digest")"
+  DMG_DIGEST="$(ghr release view "$TAG" -R "$REPO" --json assets -q ".assets[] | select(.name == \"$DMG\") | .digest")"
   SMOKE="$(get_state "smoke_$DMG_DIGEST")"
   if [ -z "$SMOKE" ] || [ "$(run_field "$SMOKE" conclusion)" != success ]; then
     SMOKE="$(start_run mac-smoke.yml -f "tag=$TAG")"
@@ -346,9 +366,9 @@ say "Verify $TAG as published files (downloaded back)"
 VER="$WORK/verify"
 rm -rf "$VER"
 mkdir -p "$VER/prev" "$VER/tgz" "$VER/mnt"
-gh release download "$TAG" -R "$REPO" -D "$VER" >/dev/null
+ghr release download "$TAG" -R "$REPO" -D "$VER" --clobber >/dev/null
 PREV_TGZ="$VER/prev/${APP}_${PREV_TAG#v}_aarch64.app.tar.gz"
-gh release download "$PREV_TAG" -R "$REPO" -p "$(basename "$PREV_TGZ")" -D "$VER/prev" >/dev/null 2>&1 || note "$PREV_TAG has no $(basename "$PREV_TGZ")"
+ghr release download "$PREV_TAG" -R "$REPO" -p "$(basename "$PREV_TGZ")" -D "$VER/prev" --clobber >/dev/null 2>&1 || note "$PREV_TAG has no $(basename "$PREV_TGZ")"
 GOT="$(cd "$VER" && find . -maxdepth 1 -type f | sed 's|^\./||' | sort)"
 if [ "$GOT" = "$(printf '%s\n' "${ASSETS[@]}" | sort)" ]; then ok "the release has exactly: ${ASSETS[*]}"
 else bad "the release has exactly: ${ASSETS[*]}"; echo "        it has: $(echo "$GOT" | tr '\n' ' ')"; fi
@@ -415,7 +435,7 @@ echo "  designated requirement: $(dr "$VER/tgz/$APP.app")"
 hdiutil detach "$VER/mnt" -quiet
 trap - EXIT
 if [ "$RSTATE" = draft ]; then
-  expect "the draft targets ${SHA:0:12}" test "$(gh api "repos/$REPO/releases" -q ".[] | select(.tag_name == \"$TAG\") | .target_commitish")" = "$SHA"
+  expect "the draft targets ${SHA:0:12}" test "$(ghr api "repos/$REPO/releases" -q ".[] | select(.tag_name == \"$TAG\") | .target_commitish")" = "$SHA"
 fi
 if [ "$RSTATE" = draft ]; then [ "$FAILS" -eq 0 ] || die "$FAILS check(s) failed. $TAG stays a draft: fix the cause and run the command again."; fi
 [ "$FAILS" -eq 0 ] || die "$FAILS check(s) failed on the published $TAG."
@@ -431,7 +451,7 @@ if [ "$RSTATE" = draft ]; then
   gh release edit "$TAG" -R "$REPO" --draft=false --latest >/dev/null
   git fetch -q origin tag "$TAG"
   expect "tag $TAG points at ${SHA:0:12}" test "$(git rev-parse "$TAG^{commit}")" = "$SHA"
-  expect "the release is public" test "$(gh release view "$TAG" -R "$REPO" --json isDraft -q .isDraft)" = false
+  expect "the release is public" test "$(ghr release view "$TAG" -R "$REPO" --json isDraft -q .isDraft)" = false
   for url in $(node -p 'Object.values(require(process.argv[1]).platforms).map((p) => p.url).join("\n")' "$VER/latest.json") "${BASE_URL}latest.json" "${BASE_URL}$DMG"; do
     code="$(curl -s -o /dev/null -L -r 0-0 -w '%{http_code}' "$url")"
     expect "$url answers ($code)" test "$code" = 200 -o "$code" = 206
