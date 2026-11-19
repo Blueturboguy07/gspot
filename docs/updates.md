@@ -22,7 +22,9 @@ before it installs anything.
 - The signature must also name the version that `latest.json` announces
   (`requireSignedVersion`). The app never installs an older version.
 - A failed automatic check goes to the log only. A failed manual check shows the error.
-- Code: `src-tauri/src/updates.rs`. Proof: `.github/workflows/updater-proof.yml`.
+- Code: `src-tauri/src/updates.rs` (unit test of the daily schedule on paused time). Proof:
+  `.github/workflows/updater-proof.yml` (test builds, a local feed) and
+  `.github/workflows/live-update-proof.yml` (a published release, the live feed).
 
 ## The key
 
@@ -37,37 +39,41 @@ update again.
 
 ## Cut a release
 
-1. Set the new version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and
-   `ui/package.json`. Add it to `CHANGELOG.md`. Push.
-2. Run `windows.yml` on that commit. Its `GSpot-windows-x64` artifact holds
-   `GSpot_<v>_x64-setup.exe` and `GSpot_<v>_x64-setup.exe.sig`.
-3. Run `publik-build.yml` on that commit. Its artifact holds the unsigned app.
-4. On the release Mac, sign, notarize and pack:
+One command on the release Mac does the whole release, for macOS arm64 and Windows x64:
+
+1. Set the new version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`,
+   `src-tauri/Cargo.lock` (the `grammarlama` entry) and `ui/package.json`. Add a `## <v>` section
+   to `CHANGELOG.md`; its first line becomes the feed's note. Commit and push to `main`.
+2. Run:
    ```sh
-   gh run download <publik-build run> -n GSpot-macos-arm64-unsigned -D in
-   scripts/sign-ci-macos.sh in/GSpot-unsigned-aarch64.app.zip out
-   gh run download <windows run> -n GSpot-windows-x64 -D out
+   scripts/publik-release.sh <v>
    ```
-   `out/` now has the dmg, `GSpot_<v>_aarch64.app.tar.gz` and its `.sig`, and the Windows files.
-   The `.app.tar.gz` is the stapled Developer ID app, so an update keeps the TCC permissions.
-5. Write the feed. The script refuses a signature that does not verify or names another version:
-   ```sh
-   node scripts/updater-latest-json.mjs --version <v> \
-     --base-url https://github.com/Blueturboguy07/gspot/releases/download/v<v>/ \
-     --platform darwin-aarch64=out/GSpot_<v>_aarch64.app.tar.gz \
-     --platform windows-x86_64=out/GSpot_<v>_x64-setup.exe \
-     --notes-file notes.md --out out/latest.json
-   (cd out && shasum -a 256 GSpot_<v>_aarch64.dmg GSpot_<v>_x64-setup.exe GSpot_<v>_aarch64.app.tar.gz > SHA256SUMS.txt)
-   ```
-6. Make a draft release with all the files:
-   ```sh
-   gh release create v<v> --draft --title "GSpot <v>" --notes-file notes.md \
-     out/GSpot_<v>_aarch64.dmg out/GSpot_<v>_x64-setup.exe \
-     out/GSpot_<v>_aarch64.app.tar.gz out/GSpot_<v>_aarch64.app.tar.gz.sig \
-     out/GSpot_<v>_x64-setup.exe.sig out/latest.json out/SHA256SUMS.txt
-   ```
-7. Run `mac-smoke.yml` with the draft tag. Publish the release. Installed copies update when
-   publik approves the release and serves its `latest.json`.
+
+The script (`scripts/publik-release.sh`):
+
+| Step | What |
+|---|---|
+| Checks | On `main`, clean tree, pushed. The version in every file above. Higher than the last release. Tag `v<v>` free. Developer ID identity, notary profile `publik`, update key in the keychain. 1.5 GB free. |
+| CI | Runs `publik-build.yml` (unsigned app) and `windows.yml` (installer and its `.sig`, unit tests, Windows e2e) on the commit and waits. A failed `windows.yml` test job is re-run once (the Edge test is flaky); the build job must pass. |
+| Mac | `scripts/sign-ci-macos.sh`: signs the app (inner code first, hardened runtime, `src-tauri/Entitlements.plist`) with `Developer ID Application: Mann Bellani (R5R3ZS54LV)`, notarizes and staples it, packs and signs the update bundle from the stapled app, builds the dmg, signs, notarizes and staples it. |
+| Feed | `latest.json` with absolute GitHub URLs (`scripts/updater-latest-json.mjs`), signed with the update key as `latest.json.sig`. `SHA256SUMS.txt`. |
+| Draft | Uploads the 8 files to a draft release `v<v>` and runs `mac-smoke.yml` on it. |
+| Verify | Downloads the draft back: the file list, the checksums, the feed and every signature with the app's public key (and that key is the last release's), the versions in Info.plist and in the Windows exe, `codesign`, `spctl` ("Notarized Developer ID"), `stapler`, the designated requirement against the last release, the publik app token (`~/.publik/gspot-app-token`) in the binary as in the last release. |
+| Publish | Only when every check passed. Then the tag and every feed URL are checked. |
+
+Run the same command again after a failure. It reuses the CI runs of the commit, the files in
+the work folder (`.release/v<v>`, git-ignored, deleted after the publish) and the draft. For a
+published release it runs the verify only. It starts no app and prints no secret: the update key
+goes from the keychain into the signer's environment only. `PUBLIK_RELEASE_NO_PUBLISH=1` stops
+after the verify and leaves the draft.
+
+publik takes new releases in once a day at 10:00 UTC. Publish before 09:30 UTC to be in that
+day's intake. Then run the live proof (below) from the old version to the new one.
+
+The steps by hand, if the script cannot run: `gh run download <publik-build run> -n
+GSpot-macos-arm64-unsigned -D in`, `scripts/sign-ci-macos.sh in/GSpot-unsigned-aarch64.app.zip out`,
+`gh run download <windows run> -n GSpot-windows-x64 -D out`, then `scripts/updater-latest-json.mjs`
+as in the script, a draft release with the 8 files, `mac-smoke.yml` on the draft, publish.
 
 `publik-build.yml` needs no update key. It makes the unsigned app only, and an update bundle of
 that app must never ship. The key is needed where the final files are made: the Windows build
@@ -105,6 +111,30 @@ The public key is compiled into each copy, so a new key reaches users only throu
    update: the attacker must also control the feed on publikhq.com.
 
 ## Test
+
+### Live proof (a published release, the live feed)
+
+Run `live-update-proof.yml` (workflow_dispatch) with `from_tag` (the release to install first)
+and `expect_version`. On `macos-latest` and `windows-latest` it downloads `from_tag` from GitHub,
+checks it, installs it as a user does and starts it with no test hook and no feed override, so
+the app asks `https://publikhq.com/api/updates/gspot/latest.json`.
+
+- `expect_version` = the version of `from_tag`: the app must find no update. Today's harness check.
+- `expect_version` higher (after publik serves it): the app must install it by itself and ask.
+  The proof answers "Restart" (the app must run the new version) and, from a fresh install, "Later"
+  (the old process keeps running; the menu offers the update again).
+- macOS: before the update it writes real TCC grants (camera, microphone, screen capture,
+  accessibility) for `com.publik.grammarlama` with the csreq of the designated requirement; after
+  it, every stored csreq must still be satisfied by the installed app (the check tccd makes) and
+  the designated requirement must be unchanged. The app stays on its sign-in window there, so the
+  accessibility grant is never used.
+- Windows: "Check for Updates…" is clicked in the tray menu and its answer is read.
+- Sign-in goes to a local stand-in (`tests/live-proof/fake-publik.py`), so a run never writes to
+  publik's database. The update feed is the real one.
+
+Code: `tests/live-proof/`. Logs, screenshots and the results table: the `live-proof-*` artifacts.
+
+### Proof with test builds
 
 Run `updater-proof.yml` (workflow_dispatch). It builds 0.0.1 and 0.0.2, installs 0.0.1 on
 `macos-latest` and `windows-latest`, and checks that 0.0.1 refuses three bad feeds and then

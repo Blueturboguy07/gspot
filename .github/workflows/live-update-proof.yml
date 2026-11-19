@@ -27,10 +27,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: live-update-proof-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
   FROM_TAG: ${{ inputs.from_tag || 'v0.2.2' }}
   EXPECT_VERSION: ${{ inputs.expect_version || '0.2.2' }}

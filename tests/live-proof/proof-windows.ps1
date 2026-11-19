@@ -156,22 +156,43 @@ function Tray-Menu([string]$item) {
   for ($attempt = 0; $attempt -lt 3; $attempt++) {
     Click-Center $icon
     $menu = $null
-    for ($i = 0; $i -lt 20 -and -not $menu; $i++) { Start-Sleep -Milliseconds 300; $menu = $root.FindFirst($TS::Children, (Cond $AE::ClassNameProperty "#32768")) }
+    # The open popup menu (class #32768). Windows also keeps a hidden one: take the one on screen.
+    for ($i = 0; $i -lt 20 -and -not $menu; $i++) {
+      Start-Sleep -Milliseconds 300
+      foreach ($m in $root.FindAll($TS::Children, (Cond $AE::ClassNameProperty "#32768"))) {
+        if (-not $m.Current.IsOffscreen -and $m.Current.BoundingRectangle.Width -gt 0) { $menu = $m; break }
+      }
+    }
     if ($menu) {
       Shot "tray-menu"
-      foreach ($e in $menu.FindAll($TS::Descendants, (Cond $AE::ControlTypeProperty $CT::MenuItem))) {
+      $items = @($menu.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition))
+      ($items | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName) '$($_.Current.Name)'" }) | Set-Content (Join-Path $Out "tray-menu-items.txt")
+      foreach ($e in $items) {
         if ($e.Current.Name -like "$item*") {
           $name = $e.Current.Name
           try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch { Click-Center $e }
-          return "clicked the tray icon, then '$name'"
+          return "clicked the tray icon, then the menu item '$name'"
         }
       }
-      Log "menu without '$item': $((@($menu.FindAll($TS::Descendants, (Cond $AE::ControlTypeProperty $CT::MenuItem))) | ForEach-Object { $_.Current.Name }) -join ', ')"
+      # No item in the accessibility tree: click the item's row, as a user does. The menu has
+      # equal rows and no separator (src-tauri/src/lib.rs), so row i is at (i + 0.5) / count.
+      $index = [array]::IndexOf($trayItems, $item)
+      if ($index -ge 0) {
+        $r = $menu.Current.BoundingRectangle
+        $y = [int]($r.Y + $r.Height * ($index + 0.5) / $trayItems.Count)
+        [Mouse]::SetCursorPos([int]($r.X + $r.Width / 2), $y) | Out-Null
+        Start-Sleep -Milliseconds 400
+        Shot "tray-menu-selected"
+        [Mouse]::Click([int]($r.X + $r.Width / 2), $y)
+        return "clicked the tray icon, then the menu row $($index + 1) of $($trayItems.Count) '$item' (menu $([int]$r.X),$([int]$r.Y) $([int]$r.Width)x$([int]$r.Height); its items are not in the accessibility tree)"
+      }
     }
     Start-Sleep 1
   }
   return $null
 }
+# The tray menu of GSpot on Windows, in order (src-tauri/src/lib.rs, start_app).
+$trayItems = @("Open GSpot", "Check for Updates", "Quit GSpot")
 
 Log "GSpot live update proof: install $FromTag, expect $want ($mode)"
 [System.Environment]::OSVersion.VersionString | Set-Content (Join-Path $Out "run.txt")
@@ -317,7 +338,8 @@ $lines = foreach ($f in Get-ChildItem $Out -Filter "app-*.log") {
 $lines | Set-Content (Join-Path $Out "updater-lines.txt")
 $lines | ForEach-Object { Write-Host $_ }
 $downloads = (Get-ChildItem $dl | ForEach-Object Name | Sort-Object) -join " "
-Check "downloads by this job before the check: only the $FromTag installer and its checksums" ($downloads -eq (@($name, "SHA256SUMS.txt") | Sort-Object) -join " ") $downloads
+$expected = (@($name, "SHA256SUMS.txt") | Sort-Object) -join " "
+Check "downloads by this job before the check: only the $FromTag installer and its checksums" ($downloads -eq $expected) $downloads
 
 Stop-App
 Stop-Process -Id $fake.Id -Force -ErrorAction SilentlyContinue
