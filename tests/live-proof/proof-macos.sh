@@ -202,24 +202,27 @@ start_app() { # log file
   open "${e[@]}" --stdout "$1.stdout" --stderr "$1" "$APP"
 }
 # Starts the app; answers the first-launch question of Gatekeeper with "Open" as a user does.
+# `open` waits while that question is on screen, so it runs in the background here.
 launch() { # log file, label
-  local i pid=""
+  local pid="" t0="$SECONDS" open_pid
   : > "$1"
-  start_app "$1"
-  for ((i = 0; i < 60; i++)); do
+  start_app "$1" &
+  open_pid=$!
+  while [ $((SECONDS - t0)) -lt 90 ]; do
     pid="$(app_pid)"
     [ -n "$pid" ] && break
     if has_window CoreServicesUIAgent; then
       shot "$2-gatekeeper-question"
-      echo "Gatekeeper asked: $(texts_of CoreServicesUIAgent)" >> "$OUT/gatekeeper.txt"
-      press CoreServicesUIAgent Open && echo "pressed Open" >> "$OUT/gatekeeper.txt"
+      echo "$2: Gatekeeper asked: $(texts_of CoreServicesUIAgent)" >> "$OUT/gatekeeper.txt"
+      press CoreServicesUIAgent Open && echo "$2: pressed Open" >> "$OUT/gatekeeper.txt"
     fi
     sleep 1
   done
   if [ -z "$pid" ]; then
     note "$2: the app did not start after open" "removing the quarantine flag and opening it again"
+    kill "$open_pid" 2>/dev/null
     xattr -d com.apple.quarantine "$APP" 2>/dev/null
-    start_app "$1"
+    start_app "$1" &
     wait_for 30 app_running
     pid="$(app_pid)"
   fi
@@ -273,8 +276,7 @@ else
   else
     note "[Restart] the question could not be pressed on this runner" "quit and reopen instead"
     quit_app
-    start_app "$LOG.reopen"
-    wait_for 30 app_running
+    launch "$LOG.reopen" reopen-after-restart-question
   fi
   PID="$(app_pid)"
   check "[Restart] GSpot runs again as a new process" "pid $OLD_PID -> ${PID:-none}" test -n "$PID" -a "$PID" != "$OLD_PID"
