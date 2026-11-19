@@ -191,6 +191,11 @@ told_version() { grep -q "install request: app_version=$1 " "$OUT/fake-publik.lo
 # The inode of the executable a process runs, and of the one on disk now.
 running_inode() { lsof -a -p "$1" -d txt -Fin 2>/dev/null | awk '/^i/ { i = substr($0, 2) } /^n/ && /\/Contents\/MacOS\/grammarlama$/ { print i; exit }'; }
 disk_inode() { stat -f %i "$APP/Contents/MacOS/$EXE"; }
+runs_disk_file() { local i; i="$(running_inode "$1")"; [ -n "$i" ] && [ "$i" = "$(disk_inode)" ]; }
+runs_old_file() { local i; i="$(running_inode "$1")"; [ -n "$i" ] && [ "$i" != "$(disk_inode)" ]; }
+no_question() { local n; n="$(windows_of UserNotificationCenter)"; [ "${n:-0}" = 0 ]; }
+# Quits GSpot (SIGTERM; an Apple event to GSpot would need an Automation consent on the runner).
+quit_app() { pkill -x "$EXE"; wait_for 15 sh -c '! pgrep -x "$1" >/dev/null' _ "$EXE" || pkill -9 -x "$EXE"; sleep 1; }
 start_app() { # log file
   local e=()
   for kv in "${ENV_VARS[@]}"; do e+=(--env "$kv"); done
@@ -228,7 +233,7 @@ log "pid $PID: $(ps -o command= -p "$PID")"
 if [ -f "$OUT/gatekeeper.txt" ]; then note "Gatekeeper first-launch question" "$(tr '\n' ' ' < "$OUT/gatekeeper.txt")"; else note "Gatekeeper first-launch question" "not shown"; fi
 if ! running_from_applications; then
   note "the app runs from $(ps -o command= -p "$PID")" "App Translocation: quit, clear the quarantine flag and open it again"
-  kill "$PID"; sleep 2
+  quit_app
   xattr -d com.apple.quarantine "$APP" 2>/dev/null
   launch "$OUT/app-1.log" first-again
 fi
@@ -243,10 +248,10 @@ if [ "$MODE" = no-update ]; then
   sleep 20
   shot no-update
   check "no update was installed or offered" "" sh -c '! grep -q "is ready" "$1"' _ "$LOG"
-  check "no question on screen (no UserNotificationCenter window)" "$(windows_of UserNotificationCenter) window(s)" sh -c '[ "${1:-0}" = 0 ]' _ "$(windows_of UserNotificationCenter)"
+  check "no question on screen (no UserNotificationCenter window)" "" no_question
   check "the app keeps running (same process)" "pid $PID" kill -0 "$PID"
   check "the running app told its version: $FROM (install request)" "" told_version "$FROM"
-  check "the running process executes the file on disk (inode)" "$(running_inode "$PID") = $(disk_inode)" test "$(running_inode "$PID")" = "$(disk_inode)"
+  check "the running process executes the file on disk (inode)" "$(running_inode "$PID") = $(disk_inode)" runs_disk_file "$PID"
   check "the app on disk is still $FROM" "$(plist "$APP" CFBundleShortVersionString)" test "$(plist "$APP" CFBundleShortVersionString)" = "$FROM"
   check "the app on disk is the same code (CDHash)" "$(cdhash "$APP")" test "$(cdhash "$APP")" = "$FROM_CDHASH"
   note "variants Restart and Later" "not applicable: the feed offers no newer version"
@@ -259,7 +264,7 @@ else
   Q="$(texts_of UserNotificationCenter)"
   check "[Restart] it says \"GSpot $EXPECT is installed. Restart GSpot to use it.\"" "$Q" sh -c 'printf "%s" "$1" | grep -q "GSpot $2 is installed"' _ "$Q" "$EXPECT"
   OLD_PID="$PID"
-  check "[Restart] until the restart, the old code keeps running (inode of the running file is not the new one)" "" test "$(running_inode "$OLD_PID")" != "$(disk_inode)"
+  check "[Restart] until the answer, the old code keeps running (inode of the running file is not the new one)" "$(running_inode "$OLD_PID") / $(disk_inode)" runs_old_file "$OLD_PID"
   forget_key
   if press UserNotificationCenter Restart; then
     note "[Restart] answered \"Restart\" in the question" "System Events click; Tauri relaunches the app with open -n"
@@ -267,21 +272,20 @@ else
     wait_for 30 sh -c 'p="$(pgrep -x "$1" | head -1)"; [ -n "$p" ] && [ "$p" != "$2" ]' _ "$EXE" "$OLD_PID"
   else
     note "[Restart] the question could not be pressed on this runner" "quit and reopen instead"
-    kill "$OLD_PID"; sleep 2
+    quit_app
     start_app "$LOG.reopen"
     wait_for 30 app_running
   fi
   PID="$(app_pid)"
   check "[Restart] GSpot runs again as a new process" "pid $OLD_PID -> ${PID:-none}" test -n "$PID" -a "$PID" != "$OLD_PID"
   check "[Restart] the new process is the installed app" "$(ps -o command= -p "${PID:-0}")" running_from_applications
-  check "[Restart] the new process executes the $EXPECT file on disk (inode)" "" test "$(running_inode "${PID:-0}")" = "$(disk_inode)"
+  check "[Restart] the new process executes the $EXPECT file on disk (inode)" "" runs_disk_file "${PID:-0}"
   check "[Restart] the running app told its version: $EXPECT (install request)" "" wait_for 60 told_version "$EXPECT"
   shot restarted
 
   # Variant B: "Later", from a fresh install of the old version.
   log "variant Later: install $FROM again"
-  osascript -e "tell application id \"$BUNDLE_ID\" to quit" 2>> "$OUT/osascript.log"
-  wait_for 15 sh -c '! pgrep -x "$1" >/dev/null' _ "$EXE" || pkill -x "$EXE"
+  quit_app
   check "[Later] GSpot $FROM installed again" "" install_from_dmg
   forget_key
   check "[Later] GSpot starts with open" "" launch "$OUT/app-2.log" later
@@ -294,20 +298,19 @@ else
     note "[Later] answered \"Later\"" "System Events click"
     sleep 15
     check "[Later] the app keeps running (same process)" "pid $LATER_PID" kill -0 "$LATER_PID"
-    check "[Later] the question is gone" "" test "$(windows_of UserNotificationCenter)" = 0
-    check "[Later] the running process is still the old code (inode)" "" test "$(running_inode "$LATER_PID")" != "$(disk_inode)"
+    check "[Later] the question is gone" "" no_question
+    check "[Later] the running process is still the old code (inode)" "$(running_inode "$LATER_PID") / $(disk_inode)" runs_old_file "$LATER_PID"
   else
     note "[Later] the question could not be pressed on this runner" "the app is left running with the question open"
   fi
   check "[Later] the new version waits on disk ($EXPECT)" "$(plist "$APP" CFBundleShortVersionString)" test "$(plist "$APP" CFBundleShortVersionString)" = "$EXPECT"
   shot later
   log "variant Later: quit and open again"
-  osascript -e "tell application id \"$BUNDLE_ID\" to quit" 2>> "$OUT/osascript.log"
-  wait_for 15 sh -c '! pgrep -x "$1" >/dev/null' _ "$EXE" || pkill -x "$EXE"
+  quit_app
   forget_key
   check "[Later] GSpot opens again" "" launch "$OUT/app-3.log" reopen
   check "[Later] after the reopen the running app reports \"$EXPECT is the latest version\"" "" wait_for 120 log_has "$OUT/app-3.log" "updates: $EXPECT is the latest version"
-  check "[Later] after the reopen it is the installed app, the $EXPECT file (inode)" "" test "$(running_inode "${PID:-0}")" = "$(disk_inode)"
+  check "[Later] after the reopen it is the installed app, the $EXPECT file (inode)" "" runs_disk_file "${PID:-0}"
 fi
 
 # ---- 5. After: signature, Gatekeeper, TCC -----------------------------------------------------
