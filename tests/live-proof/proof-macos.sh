@@ -233,13 +233,16 @@ running_from_applications() { ps -o command= -p "$PID" | grep -q "^$APP/Contents
 
 check "GSpot starts with open" "" launch "$OUT/app-1.log" first
 log "pid $PID: $(ps -o command= -p "$PID")"
-if [ -f "$OUT/gatekeeper.txt" ]; then note "Gatekeeper first-launch question" "$(tr '\n' ' ' < "$OUT/gatekeeper.txt")"; else note "Gatekeeper first-launch question" "not shown"; fi
 if ! running_from_applications; then
-  note "the app runs from $(ps -o command= -p "$PID")" "App Translocation: quit, clear the quarantine flag and open it again"
+  # A drag in a Finder window marks the copy as moved by the user; a Finder copy made by a script
+  # does not, so macOS can start it from a read-only translocated copy.
+  note "the app runs from $(ps -o command= -p "$PID")" "App Translocation (the copy was made by a script, not by a drag): quit, clear the quarantine flag of the bundle and open it again"
   quit_app
+  forget_key
   xattr -d com.apple.quarantine "$APP" 2>/dev/null
   launch "$OUT/app-1.log" first-again
 fi
+if [ -f "$OUT/gatekeeper.txt" ]; then note "Gatekeeper first-launch question" "$(tr '\n' ' ' < "$OUT/gatekeeper.txt")"; else note "Gatekeeper first-launch question" "not shown"; fi
 check "it runs from /Applications (not translocated)" "$(ps -o command= -p "$PID")" running_from_applications
 shot started
 

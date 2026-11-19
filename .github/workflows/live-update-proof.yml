@@ -20,16 +20,13 @@ on:
       expect_version:
         description: Version the app must run after the live check (N+1, or N for "no update")
         required: true
-  # TEMPORARY: lets the harness run before it is on main (dispatch needs the default branch).
-  push:
-    branches: ['live-proof/**']
 
 permissions:
   contents: read
 
 env:
-  FROM_TAG: ${{ inputs.from_tag || 'v0.2.2' }}
-  EXPECT_VERSION: ${{ inputs.expect_version || '0.2.2' }}
+  FROM_TAG: ${{ inputs.from_tag }}
+  EXPECT_VERSION: ${{ inputs.expect_version }}
 
 jobs:
   macos:
