@@ -151,6 +151,15 @@ else
   xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1 || die "the notary profile \"$PROFILE\" does not work (xcrun notarytool store-credentials)"
   ok "notary profile: $PROFILE"
 fi
+# The work folder belongs to one commit: files from another commit's builds are never reused.
+if [ "$RSTATE" != published ]; then
+  if [ -n "$(get_state sha)" ] && [ "$(get_state sha)" != "$SHA" ]; then
+    note "the work folder has the builds of $(get_state sha | cut -c1-12): starting it again for ${SHA:0:12}"
+    rm -rf "$WORK/in" "$WORK/out" "$WORK/verify" "$WORK/changes.md" "$WORK/feed-notes.txt" "$WORK/release-notes.md"
+    : > "$STATE"
+  fi
+  [ "$(get_state sha)" = "$SHA" ] || set_state sha "$SHA"
+fi
 FREE_KB="$(df -k "$WORK" | awk 'NR == 2 { print $4 }')"
 [ "$FREE_KB" -ge 1500000 ] || die "only $((FREE_KB / 1024)) MB free on the disk of $WORK; the release needs 1.5 GB"
 ok "disk: $((FREE_KB / 1024)) MB free"
@@ -282,7 +291,8 @@ if [ "$RSTATE" != published ]; then
   else
     say "Download the CI builds"
     [ -f "$OUT/SHA256SUMS-windows.txt" ] || ghr run download "$WIN_RUN" -R "$REPO" -n GSpot-windows-x64 -D "$OUT"
-    (cd "$OUT" && shasum -a 256 -c SHA256SUMS-windows.txt >/dev/null) || die "the Windows installer does not match the CI checksum"
+    # PowerShell wrote the checksum file with CRLF line ends.
+    (cd "$OUT" && tr -d '\r' < SHA256SUMS-windows.txt | shasum -a 256 -c - >/dev/null) || die "the Windows installer does not match the CI checksum"
     [ -f "$OUT/$EXE" ] && [ -f "$OUT/$EXE.sig" ] || die "the windows.yml artifact has no $EXE and $EXE.sig"
     ok "$EXE and its .sig (checksum as built by CI)"
     [ -f "$IN/GSpot-unsigned-aarch64.app.zip" ] || ghr run download "$MAC_RUN" -R "$REPO" -n GSpot-macos-arm64-unsigned -D "$IN"
@@ -399,7 +409,7 @@ fi
 expect "latest.json.sig is there" test -s "$VER/latest.json.sig"
 expect "Windows installer version resource is $V" node scripts/exe-version.mjs "$VER/$EXE" --expect "$V"
 if [ -f "$OUT/SHA256SUMS-windows.txt" ]; then
-  expect "Windows installer is the CI build, byte for byte" grep -q "^$(sha "$VER/$EXE")  $EXE\$" "$OUT/SHA256SUMS-windows.txt"
+  expect "Windows installer is the CI build, byte for byte" sh -c 'tr -d "\r" < "$1" | grep -qx "$2  $3"' _ "$OUT/SHA256SUMS-windows.txt" "$(sha "$VER/$EXE")" "$EXE"
 fi
 
 # The dmg and the app in it.
