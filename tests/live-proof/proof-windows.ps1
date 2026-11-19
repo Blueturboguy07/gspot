@@ -211,7 +211,7 @@ Invoke-WebRequest "https://github.com/$repo/releases/download/$FromTag/SHA256SUM
 $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
 Check "the installer is the release's (SHA256SUMS.txt)" ((Get-Content (Join-Path $dl "SHA256SUMS.txt")) -contains "$hash  $name") $hash.Substring(0, 16)
 Check "the installer carries version $from" ((Get-Item $installer).VersionInfo.ProductVersion -eq $from) (Get-Item $installer).VersionInfo.ProductVersion
-Note "installer" "not code-signed; a browser download would get SmartScreen's 'Run anyway' once; the silent install (/S) is what the brief asks"
+Note "installer" "the release's installer in its silent mode (/S): the same install as a user's, without clicking through its pages; it is not code-signed, so a browser download gets SmartScreen's 'Run anyway' once"
 function Install-From {
   Stop-App
   $un = Join-Path $env:LOCALAPPDATA "GSpot\uninstall.exe"
