@@ -90,8 +90,8 @@ ghr() {
       *"rate limit"* | *"HTTP 5"* | *"timed out"* | *"timeout"* | *"connection"* | *"EOF"* | *"TLS"*) ;;
       *) printf '%s\n' "$err" >&2; return 1 ;;
     esac
-    echo "    GitHub API: ${err:0:110}... waiting 60 s (try $i of 45)" >&2
-    sleep 60
+    echo "    GitHub API: ${err:0:110}... waiting 90 s (try $i of 45)" >&2
+    sleep 90
   done
   printf '%s\n' "$err" >&2
   return 1
@@ -182,7 +182,11 @@ with_update_key() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# At most one GitHub API call per 90 s while waiting: other jobs of the user share the limit.
+POLL=90
 run_field() { ghr run view "$1" -R "$REPO" --json "$2" -q ".$2"; }
+# "status conclusion" of a run in one call.
+run_state() { ghr run view "$1" -R "$REPO" --json status,conclusion -q '"\(.status) \(.conclusion)"'; }
 # The newest workflow_dispatch run of a workflow on $SHA, or nothing.
 last_run() {
   ghr run list -R "$REPO" --workflow "$1" --commit "$SHA" --event workflow_dispatch -L 20 \
@@ -194,23 +198,26 @@ start_run() {
   shift
   before="$(ghr run list -R "$REPO" --workflow "$wf" -L 50 --json databaseId -q '.[].databaseId' | sort)"
   gh workflow run "$wf" -R "$REPO" --ref "$BRANCH" "$@" >/dev/null
-  for _ in $(seq 1 40); do
-    sleep 5
+  sleep 15
+  for _ in $(seq 1 10); do
     id="$(ghr run list -R "$REPO" --workflow "$wf" --commit "$SHA" --event workflow_dispatch -L 20 --json databaseId -q '.[].databaseId' |
       sort | comm -13 <(printf '%s\n' "$before") - | tail -1)"
     [ -n "$id" ] && { echo "$id"; return; }
+    sleep "$POLL"
   done
   die "$wf did not start"
 }
+# Waits for a run to complete; its conclusion is then in $RUN_CONCLUSION.
 wait_run() {
-  local id="$1" t=0 status
+  local id="$1" t=0 st
   while :; do
-    status="$(run_field "$id" status)"
-    [ "$status" = completed ] && break
-    [ $((t % 300)) -eq 0 ] && echo "    run $id: $status ($((t / 60)) min)"
-    sleep 30; t=$((t + 30))
+    st="$(run_state "$id")"
+    [ "${st%% *}" = completed ] && break
+    [ $((t % (POLL * 4))) -eq 0 ] && echo "    run $id: ${st%% *} ($((t / 60)) min)"
+    sleep "$POLL"; t=$((t + POLL))
     [ "$t" -lt 9000 ] || die "run $id did not finish in 150 minutes"
   done
+  RUN_CONCLUSION="${st#* }"
 }
 # windows.yml may re-run its failed jobs once when its build job passed (the Edge e2e is flaky).
 can_rerun() {
@@ -225,9 +232,10 @@ rerun_failed() {
 }
 # A run of the workflow on $SHA that is successful, running, or worth a re-run; else a new one.
 ensure_run() {
-  local wf="$1" id
+  local wf="$1" id st=""
   id="$(last_run "$wf")"
-  if [ -n "$id" ] && [ "$(run_field "$id" status)" = completed ] && [ "$(run_field "$id" conclusion)" != success ]; then
+  [ -z "$id" ] || st="$(run_state "$id")"
+  if [ -n "$id" ] && [ "${st%% *}" = completed ] && [ "${st#* }" != success ]; then
     if can_rerun "$wf" "$id"; then rerun_failed "$wf" "$id"; else id=""; fi
   fi
   if [ -z "$id" ]; then
@@ -240,11 +248,11 @@ ensure_run() {
 finish_run() {
   local wf="$1" id="$2" conclusion
   wait_run "$id"
-  conclusion="$(run_field "$id" conclusion)"
+  conclusion="$RUN_CONCLUSION"
   if [ "$conclusion" != success ] && can_rerun "$wf" "$id"; then
     rerun_failed "$wf" "$id"
     wait_run "$id"
-    conclusion="$(run_field "$id" conclusion)"
+    conclusion="$RUN_CONCLUSION"
   fi
   [ "$conclusion" = success ] || die "$wf run $id ended with $conclusion: https://github.com/$REPO/actions/runs/$id"
 }
@@ -351,7 +359,7 @@ if [ "$RSTATE" != published ]; then
     SMOKE="$(start_run mac-smoke.yml -f "tag=$TAG")"
     echo "    started mac-smoke.yml: https://github.com/$REPO/actions/runs/$SMOKE"
     wait_run "$SMOKE"
-    [ "$(run_field "$SMOKE" conclusion)" = success ] || die "mac-smoke.yml failed on the draft: https://github.com/$REPO/actions/runs/$SMOKE"
+    [ "$RUN_CONCLUSION" = success ] || die "mac-smoke.yml failed on the draft: https://github.com/$REPO/actions/runs/$SMOKE"
     set_state "smoke_$DMG_DIGEST" "$SMOKE"
   fi
   ok "mac-smoke.yml: https://github.com/$REPO/actions/runs/$SMOKE"
