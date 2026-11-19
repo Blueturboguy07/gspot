@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3 (2026-11-19)
+
+No change in what the app does. This release proves the update from 0.2.2.
+
+- The app does the same as in 0.2.2. The version number is new.
+- `scripts/publik-release.sh <version>` makes the whole release in one command. See `docs/updates.md`.
+- `live-update-proof.yml` installs a published release on clean macOS and Windows runners and checks the update from the live publik feed.
+
 ## 0.2.2 (2026-11-18)
 
 Updates.
