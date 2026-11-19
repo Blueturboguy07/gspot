@@ -33,7 +33,16 @@ APP="$WORK/x/GSpot.app"
 [ -d "$APP" ] || { echo "No GSpot.app in $ZIP" >&2; exit 1; }
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
 echo "==> GSpot $VERSION: signing with $IDENTITY"
-# Same as the Tauri bundler: one executable, hardened runtime, the (empty) entitlements, a timestamp.
+# Inner code first (any Mach-O file in the bundle other than the main executable: a helper, a
+# dylib), then the app itself. GSpot has one executable, so this loop normally signs nothing.
+MAIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+find "$APP/Contents" -type f ! -path "$APP/Contents/MacOS/$MAIN" -print0 | while IFS= read -r -d '' f; do
+  if file -b "$f" | grep -q "Mach-O"; then
+    echo "    inner code: ${f#"$APP/"}"
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$f"
+  fi
+done
+# Same as the Tauri bundler: hardened runtime, the (empty) entitlements, a timestamp.
 codesign --force --options runtime --timestamp --entitlements "$ROOT/src-tauri/Entitlements.plist" --sign "$IDENTITY" "$APP"
 codesign --verify --strict --deep --verbose=2 "$APP"
 

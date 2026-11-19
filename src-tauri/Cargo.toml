@@ -38,6 +38,10 @@ uuid = { version = "1", features = ["v4"] }
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 
+[dev-dependencies]
+# Paused time for the unit test of the daily update check (updates.rs). No new crate.
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 objc2 = "0.6"

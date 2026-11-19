@@ -5,3 +5,6 @@ src-tauri/gen/schemas
 *.log
 .DS_Store
 ui/node_modules
+
+# scripts/publik-release.sh work folder
+.release
