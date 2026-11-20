@@ -292,6 +292,8 @@ else
   log "variant Later: install $FROM again"
   quit_app
   check "[Later] GSpot $FROM installed again" "" install_from_dmg
+  # Gatekeeper's first-launch question was answered in the first variant: the second copy starts without it.
+  xattr -dr com.apple.quarantine "$APP" 2>/dev/null
   forget_key
   check "[Later] GSpot starts with open" "" launch "$OUT/app-2.log" later
   LOG="$OUT/app-2.log"
