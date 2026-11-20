@@ -145,7 +145,7 @@ function Press($w, [string]$name) {
 $trayClasses = @("Shell_TrayWnd", "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland")
 function Tray-Hosts { foreach ($w in $root.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)) { if ($trayClasses -contains $w.Current.ClassName) { $w } } }
 function Tray-Buttons { foreach ($h in @(Tray-Hosts)) { foreach ($b in $h.FindAll($TS::Descendants, (Cond $AE::ControlTypeProperty $CT::Button))) { $b } } }
-function Find-TrayIcon { foreach ($b in @(Tray-Buttons)) { if ($b.Current.Name -like "*GSpot*" -and -not $b.Current.IsOffscreen) { return $b } }; return $null }
+function Find-TrayIcon { foreach ($b in @(Tray-Buttons)) { if ($b.Current.Name -like "*GSpot*" -and $b.Current.Name -notmatch "running window|pinned" -and -not $b.Current.IsOffscreen) { return $b } }; return $null }
 # Clicks GSpot's tray icon (opening "Show hidden icons" first when it is hidden there), then the
 # menu item. Returns the result text for the results table, or $null.
 function Tray-Menu([string]$item) {
