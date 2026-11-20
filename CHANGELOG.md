@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4 (2026-11-20)
+
+After you sign in with publik, the app opens at once. The app asks you to get a plan only when your usage is at zero.
+
+- After sign-in, GSpot opens at once and uses your publik account for AI. The "Choose how to pay for AI" and "Connect your plan" window does not open at start.
+- When your publik usage is at zero, the AI feature shows publik's message. Settings → AI shows the same message with one link to get a plan.
+- An answer that you gave before ("Use my own key" or "Connect your plan") is kept. An own key that you pasted in Settings → AI stays as it is.
+- Settings → AI still changes between publik API and your own key.
+
 ## 0.2.3 (2026-11-19)
 
 No change in what the app does. This release proves the update from 0.2.2.

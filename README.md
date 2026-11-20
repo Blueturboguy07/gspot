@@ -27,9 +27,10 @@ tucks into the left. `dock_side` in Settings flips it.)
   edit control's own select-and-replace messages (Notepad, WordPad, other Win32 edit and rich-edit
   fields), then a UI Automation selection plus a verified Ctrl+V paste (browsers, Office), then the
   field's UI Automation value for plain fields.
-* Sign in with publik: GSpot opens with a sign-in window. A signed-in person then picks publik API
-  ("Get a plan" or "Connect your plan") or their own key ("Use my own key"). The answer is kept, and
-  Settings → AI changes it later.
+* Sign in with publik: GSpot opens with a sign-in window. After sign-in, GSpot opens at once and
+  uses publik API; there is no pay screen at start. When publik answers 402 (no plan, no usage
+  left), the feature shows publik's message, and Settings → AI shows it with one link to get a
+  plan. A stored answer (publik API or "Use my own key") is kept, and Settings → AI changes it.
 * AI features: **publik API** (this computer's publik key, minted at sign-in; a plan or a balance on
   your publik account pays per use at a published price),
   or your own key (paste it; OpenAI, Anthropic, OpenRouter, Groq and Google are detected from the

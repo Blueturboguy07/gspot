@@ -18,7 +18,7 @@
 // At app start, before any window of your own: `let gate = publik::ensure_signed_in(&mut ui);`. It
 //   1. loads or provisions this computer's publik key (POST /api/v1/installs);
 //   2. shows Sign in with publik until GET /api/v1/wallet says "claimed" (no other way past it);
-//   3. when USES_AI: asks once how the app pays for AI and stores the answer (set_choice() changes it);
+//   3. when USES_AI: uses the publik account for AI, with no pay screen (set_choice() changes it);
 //   4. starts usage counting: app_opened now, active_session every 30 minutes (POST /api/v1/telemetry).
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 pub const APP_SLUG: &str = "gspot";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// false: the app calls no model. It still signs in and counts users; it skips the plan screen.
+/// false: the app calls no model. It still signs in and counts users; it stores no choice.
 pub const USES_AI: bool = true;
 /// Ask for a tier, never a vendor model name.
 pub const MODELS: [&str; 3] = ["publik-fast", "publik-balanced", "publik-smart"];
@@ -187,7 +187,7 @@ fn ask(ui: &mut dyn GateUi, screen: &Screen, key: &str, until: Option<fn(&Value)
 /// The gate (see the top of the file). Returns (key, wallet, choice) once the person is signed in; choice is None when USES_AI is false.
 pub fn ensure_signed_in(ui: &mut dyn GateUi) -> (String, Value, Option<String>) {
     if std::env::var_os("PUBLIK_SELF_TEST").is_some() { println!("{}", self_test()); std::process::exit(0); }
-    let (mut sign_note, mut sign_poll, mut plan_note, mut plan_poll): (Option<&'static str>, bool, Option<&'static str>, bool) = (None, true, None, false);
+    let (mut sign_note, mut sign_poll): (Option<&'static str>, bool) = (None, true);
     loop {
         let env_key = std::env::var("PUBLIK_API_KEY").ok().filter(|k| !k.is_empty());
         let c = match env_key.clone().map(|k| Ok(json!({ "key": k }))).or_else(|| read_credential().map(Ok)).unwrap_or_else(provision) {
@@ -211,19 +211,7 @@ pub fn ensure_signed_in(ui: &mut dyn GateUi) -> (String, Value, Option<String>) 
             continue;
         }
         let mut choice = if USES_AI { read_credential().and_then(|c| c["choice"].as_str().map(String::from)) } else { None };
-        if USES_AI && choice.is_none() {
-            if has_plan(&w) { (plan_note, plan_poll) = (None, false); } // the plan is there: Connect your plan
-            let a = ask(ui, &gate_screen("choose", Some(&w), plan_note, None), &key, if plan_poll { Some(has_plan) } else { None });
-            (plan_note, plan_poll) = (None, false);
-            if a == "get_plan" {
-                ui.open_url(w["top_up_url"].as_str().unwrap_or(&format!("{}/wallet", origin())));
-                (plan_note, plan_poll) = (Some("Waiting for your plan. Finish in your browser."), true);
-            }
-            if a == "timeout" { plan_note = Some("No plan after 10 minutes. Click Get a plan to try again."); }
-            if a != "connect" && a != "own_key" { continue; } // "done": the plan is there; the next screen is Connect your plan
-            choice = Some(if a == "connect" { "publik" } else { "own_key" }.to_string());
-            set_choice(choice.as_deref());
-        }
+        if USES_AI && choice.is_none() { choice = Some("publik".to_string()); set_choice(choice.as_deref()); } // no pay screen at start: publik is the choice; the app offers a plan when publik answers 402
         start_telemetry();
         return (key, w, choice);
     }
@@ -762,12 +750,13 @@ pub fn status(settings: &crate::settings::Settings) -> Value {
 
 /// The gate's answer, applied to Settings → AI once at start-up: "publik" selects publik API;
 /// "own_key" keeps an own-key provider as it is, and moves the publik default to the own-key
-/// card, which then asks for the key.
+/// card, which then asks for the key. The gate stores "publik" by itself after sign-in (no pay
+/// screen at start), so "publik" keeps an own key the person pasted in Settings → AI.
 pub fn apply_choice(settings: &mut crate::settings::Settings, choice: Option<&str>) {
     let publik = crate::settings::Provider::Publik;
     match choice {
         Some("publik") => {
-            if settings.llm.provider != publik {
+            if settings.llm.provider != publik && settings.llm.api_key.trim().is_empty() {
                 settings.llm = crate::settings::LlmConfig::default();
             }
         }
@@ -888,5 +877,101 @@ mod tests {
         apply_choice(&mut s, Some("own_key"));
         assert_eq!(s.llm.provider, Provider::Anthropic);
         assert_eq!(s.llm.api_key, "sk-ant-x");
+        // The gate stores "publik" by itself after sign-in: that own key stays as it is too.
+        apply_choice(&mut s, Some("publik"));
+        assert_eq!(s.llm.provider, Provider::Anthropic);
+        assert_eq!(s.llm.api_key, "sk-ant-x");
+    }
+
+    /// A stand-in for `GET /api/v1/wallet` on 127.0.0.1: every request gets the wallet in `w`.
+    fn fake_wallet_server(w: Arc<Mutex<Value>>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !String::from_utf8_lossy(&req).contains("\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = w.lock().unwrap().to_string();
+                let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body);
+                let _ = s.flush();
+            }
+        });
+        origin
+    }
+
+    /// The gate's window in a test. It records every screen, presses "Sign in with publik" and
+    /// finishes the browser sign-in at once (the wallet turns "claimed"). Any other screen fails.
+    struct FakeUi {
+        wallet: Arc<Mutex<Value>>,
+        shown: Vec<&'static str>,
+        opened: Vec<String>,
+    }
+    impl GateUi for FakeUi {
+        fn show(&mut self, s: &Screen, _done: Arc<AtomicBool>) -> Option<&'static str> {
+            self.shown.push(s.id);
+            assert!(self.shown.len() < 5, "the gate keeps asking: {:?}", self.shown);
+            assert_eq!(s.id, "sign_in", "the gate showed \"{}\": {}", s.title, s.body);
+            self.wallet.lock().unwrap()["claim_state"] = json!("claimed");
+            Some("sign_in")
+        }
+        fn open_url(&mut self, url: &str) {
+            self.opened.push(url.to_string());
+        }
+    }
+
+    /// One test for the whole gate, so no other test sees its environment variables change.
+    #[test]
+    fn after_sign_in_the_app_opens_with_no_pay_screen() {
+        let dir = std::env::temp_dir().join(format!("gspot-gate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The credential file goes to <dir>/.../publik/apps/gspot.json on every system.
+        for v in ["HOME", "USERPROFILE", "LOCALAPPDATA", "XDG_CONFIG_HOME"] {
+            std::env::set_var(v, &dir);
+        }
+        for v in ["PUBLIK_API_KEY", "PUBLIK_SELF_TEST"] {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("DO_NOT_TRACK", "1");
+        let wallet = Arc::new(Mutex::new(json!({ "claim_state": "anonymous", "account": { "handle": "mann" }, "plan": { "kind": "none", "label": null }, "balance_micros": 0 })));
+        std::env::set_var("PUBLIK_ORIGIN", fake_wallet_server(wallet.clone()));
+        let cred_file = |choice: Value| json!({ "key": "pk_test", "base_url": "https://publikhq.com/api/v1", "install_id": "00000000-0000-4000-8000-000000000000", "claim_url": "https://publikhq.com/claim/TEST", "choice": choice });
+
+        // 1. Sign in, then straight in: Sign in with publik is the only screen, and the gate stores "publik".
+        write_credential(&cred_file(Value::Null)).unwrap();
+        let mut ui = FakeUi { wallet: wallet.clone(), shown: vec![], opened: vec![] };
+        let (key, w, choice) = ensure_signed_in(&mut ui);
+        assert_eq!(ui.shown, vec!["sign_in"]);
+        assert_eq!(ui.opened, vec!["https://publikhq.com/claim/TEST".to_string()]);
+        assert_eq!((key.as_str(), choice.as_deref()), ("pk_test", Some("publik")));
+        assert!(claimed(&w) && !has_plan(&w), "signed in, no plan, no balance");
+        let c = read_credential().unwrap();
+        assert_eq!((c["choice"].as_str(), c["key"].as_str()), (Some("publik"), Some("pk_test")));
+
+        // 2. Signed in with no plan and no stored choice: no screen at all.
+        write_credential(&cred_file(Value::Null)).unwrap();
+        let mut ui = FakeUi { wallet: wallet.clone(), shown: vec![], opened: vec![] };
+        let (_, _, choice) = ensure_signed_in(&mut ui);
+        assert!(ui.shown.is_empty() && ui.opened.is_empty(), "screens: {:?}", ui.shown);
+        assert_eq!(choice.as_deref(), Some("publik"));
+        assert_eq!(read_credential().unwrap()["choice"], "publik");
+
+        // 3. A stored "own_key" is kept as it is: no screen, no change.
+        write_credential(&cred_file(json!("own_key"))).unwrap();
+        let mut ui = FakeUi { wallet: wallet.clone(), shown: vec![], opened: vec![] };
+        let (_, _, choice) = ensure_signed_in(&mut ui);
+        assert!(ui.shown.is_empty() && ui.opened.is_empty(), "screens: {:?}", ui.shown);
+        assert_eq!(choice.as_deref(), Some("own_key"));
+        assert_eq!(read_credential().unwrap()["choice"], "own_key");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
